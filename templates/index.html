@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LAN Projector Queue</title>
+    <style>
+        * { box-sizing: border-box; }
+        [hidden] { display: none !important; }  /* explicit display rules below must not override hidden */
+        body { font-family: system-ui, sans-serif; background: #121212; color: #e0e0e0; margin: 0 auto; padding: 0 16px 16px; max-width: 1100px; }
+        .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 0; border-bottom: 1px solid #2d2d2d; margin-bottom: 8px; }
+        .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 1.05rem; letter-spacing: .02em; }
+        .brand .dot { width: 10px; height: 10px; border-radius: 50%; background: #ff5722; box-shadow: 0 0 10px #ff5722aa; }
+        .brand span.sub { color: #777; font-weight: normal; font-size: .85rem; }
+        .name-box { width: min(240px, 50vw); padding: 9px 12px; border-radius: 8px; border: 1px solid #333; background: #1e1e1e; color: #fff; font-size: .95rem; }
+        .name-box:focus { outline: none; border-color: #ff5722; }
+        .tracks { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+        .tracks label { display: flex; align-items: center; gap: 6px; color: #999; font-size: .85rem; }
+        .tracks select { background: #222; color: #fff; border: 1px solid #333; border-radius: 6px; padding: 6px 8px; font-size: .9rem; max-width: 60vw; color-scheme: dark; }
+        .tracks select option { background: #222; color: #fff; }
+        .tracks .pref { color: #888; font-size: .8rem; align-self: center; }
+        .tracks .pref a { color: #ff5722; cursor: pointer; margin-left: 6px; }
+        h2 { font-size: 1rem; color: #999; text-transform: uppercase; letter-spacing: .05em; margin: 20px 0 8px; display: flex; justify-content: space-between; align-items: baseline; }
+        h2 small { text-transform: none; letter-spacing: 0; font-weight: normal; color: #666; }
+        .panel { background: #1e1e1e; border: 1px solid #2d2d2d; border-radius: 10px; padding: 14px; }
+        button { background: #333; color: #fff; border: none; padding: 10px 14px; border-radius: 6px; cursor: pointer; font-weight: bold; white-space: nowrap; font-size: .95rem; }
+        button:hover { background: #444; }
+        button:disabled { opacity: .5; cursor: default; }
+        button.primary { background: #ff5722; }
+        button.primary:hover { background: #e64a19; }
+        button.danger { background: #5a1f1f; }
+        .muted { color: #888; text-align: center; padding: 12px; }
+
+        /* posters */
+        .poster { position: relative; background: linear-gradient(160deg, #2a2a2a, #1a1a1a); border-radius: 6px; overflow: hidden; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #555; font-size: .7rem; text-align: center; padding: 4px; }
+        .poster img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
+        .poster.thumb { width: 44px; height: 66px; }
+
+        /* now playing */
+        .now { display: flex; gap: 14px; align-items: flex-start; }
+        .now .poster { width: 80px; height: 120px; }
+        .now .info { flex: 1; min-width: 0; }
+        #now-title { font-weight: bold; font-size: 1.15rem; word-break: break-word; }
+        #now-file { color: #888; font-size: .8rem; word-break: break-all; }
+        #now-state { color: #999; font-size: .9rem; margin-top: 4px; }
+        .progress { height: 6px; background: #333; border-radius: 3px; margin: 10px 0; overflow: hidden; }
+        .progress > div { height: 100%; background: #ff5722; width: 0; transition: width .5s linear; }
+        .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+
+        /* queue */
+        /* Long queues (a whole season) scroll inside the panel instead of pushing the library down. */
+        #queue { padding: 4px 0; max-height: min(420px, 50vh); overflow-y: auto; overscroll-behavior: contain; }
+        .queue-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 1px solid #2d2d2d; background: #1e1e1e; }
+        .queue-item:last-child { border-bottom: none; }
+        .queue-item.current { color: #ff5722; position: sticky; top: 0; z-index: 1; box-shadow: 0 2px 6px #0008; }
+        .queue-item .handle { cursor: grab; color: #666; font-size: 1.4rem; padding: 4px 6px; touch-action: none; user-select: none; }
+        .queue-item .text { flex: 1; min-width: 0; }
+        .queue-item .title { font-weight: bold; }
+        .queue-item .file { color: #888; font-size: .78rem; word-break: break-all; }
+        .queue-item.sortable-ghost { opacity: .3; }
+        .queue-item.sortable-chosen { background: #2a2a2a; }
+
+        /* library */
+        .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+        .search-box { flex: 1 1 240px; padding: 12px; border-radius: 8px; border: 1px solid #333; background: #222; color: #fff; font-size: 1rem; }
+        .chip { background: #222; border: 1px solid #333; font-weight: normal; }
+        .chip.active { background: #ff5722; border-color: #ff5722; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; }
+        .card { background: #1e1e1e; border: 1px solid #2d2d2d; border-radius: 10px; overflow: hidden; cursor: pointer; display: flex; flex-direction: column; }
+        .card:hover { border-color: #ff5722; }
+        .card .poster { width: 100%; aspect-ratio: 2 / 3; border-radius: 0; font-size: .9rem; color: #777; }
+        .card .meta { padding: 8px; }
+        .card .title { font-weight: bold; font-size: .9rem; line-height: 1.2; }
+        .card .sub { color: #888; font-size: .75rem; margin-top: 3px; }
+
+        /* detail sheet */
+        #sheet-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; z-index: 10; }
+        #sheet { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(700px, calc(100vw - 32px)); max-height: 85vh; background: #1e1e1e; border: 1px solid #333; border-radius: 14px; padding: 16px; display: none; z-index: 11; overflow-y: auto; }
+        #sheet.open, #sheet-backdrop.open { display: block; }
+        .sheet-head { display: flex; gap: 14px; margin-bottom: 12px; }
+        .sheet-head .poster { width: 90px; height: 135px; }
+        .sheet-head h3 { margin: 0 0 4px; }
+        .sheet-file { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0 8px 12px; border-top: 1px solid #2d2d2d; }
+        .sheet-file .name { word-break: break-all; font-size: .9rem; }
+        .sheet-season { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 0 6px; margin-top: 8px; border-top: 2px solid #333; }
+        .sheet-season .season-name { font-weight: bold; color: #ff5722; }
+
+        #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #ff5722; color: #fff; padding: 12px 20px; border-radius: 8px; opacity: 0; transition: opacity .3s; pointer-events: none; max-width: 90vw; z-index: 20; }
+        #toast.show { opacity: 1; }
+        #toast.error { background: #c62828; }
+    </style>
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand"><span class="dot"></span>Projector <span class="sub">LAN queue</span></div>
+        <input type="text" id="username" class="name-box" placeholder="Your name (optional)" maxlength="40" autocomplete="off">
+    </header>
+
+    <h2>Now playing</h2>
+    <div class="panel now">
+        <div class="poster" id="now-poster"></div>
+        <div class="info">
+            <div id="now-title">Connecting to VLC...</div>
+            <div id="now-file"></div>
+            <div id="now-state"></div>
+            <div class="progress"><div id="progress-bar"></div></div>
+            <div class="controls">
+                <button data-action="previous">⏮</button>
+                <button data-action="pause" class="primary">⏯ Play / Pause</button>
+                <button data-action="next">⏭</button>
+                <button data-action="stop">⏹</button>
+                <button data-action="fullscreen">⛶</button>
+            </div>
+            <div class="tracks" id="tracks" hidden>
+                <label>Audio <select id="track-audio"></select></label>
+                <label>Subtitles <select id="track-subtitle"></select></label>
+                <span class="pref" id="track-pref" hidden></span>
+            </div>
+        </div>
+    </div>
+
+    <h2>Up next <small id="queue-meta">drag ⠿ to reorder</small></h2>
+    <div class="panel" id="queue"><div class="muted">Queue is empty</div></div>
+
+    <h2>Library <small id="lib-count"></small></h2>
+    <div class="toolbar">
+        <input type="text" id="search" class="search-box" placeholder="Search movies, TV shows, anime..." autocomplete="off">
+        <div id="chips"></div>
+    </div>
+    <div class="grid" id="grid"><div class="muted">Loading NAS library...</div></div>
+    <div class="muted" id="grid-note"></div>
+
+    <div id="sheet-backdrop"></div>
+    <div id="sheet"></div>
+    <div id="toast"></div>
+
+    <script src="/static/Sortable.min.js"></script>
+    <script>
+        let groups = [];
+        let activeLibrary = '';
+        let dragging = false;
+        let toastTimer;
+        let lastCurrentId = null;
+        const MAX_CARDS = 200;
+
+        // Optional name, remembered on this device and sent with every queue request.
+        const nameBox = document.getElementById('username');
+        try { nameBox.value = localStorage.getItem('lanq_name') || ''; } catch (e) {}
+        nameBox.addEventListener('input', () => { try { localStorage.setItem('lanq_name', nameBox.value.trim()); } catch (e) {} });
+
+        function fmtDuration(s) {
+            s = Math.max(0, Math.round(s || 0));
+            const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+            return h ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
+        }
+
+        function toast(msg, isError = false) {
+            const el = document.getElementById('toast');
+            el.textContent = msg;
+            el.className = 'show' + (isError ? ' error' : '');
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => el.className = '', 3000);
+        }
+
+        async function api(path, options = {}) {
+            if (options.body && !options.headers) options.headers = {'Content-Type': 'application/json'};
+            const res = await fetch(path, options);
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+            return data;
+        }
+
+        function fmtTime(s) {
+            s = Math.max(0, Math.floor(s || 0));
+            const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+            return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(sec).padStart(2, '0');
+        }
+
+        // Poster element: the title as a placeholder, with the image laid over it once it loads.
+        // The img must be in the DOM from the start or lazy loading never triggers.
+        function posterEl(url, title, extraClass = '') {
+            const div = document.createElement('div');
+            div.className = 'poster ' + extraClass;
+            div.textContent = title || '';
+            if (url) {
+                const img = document.createElement('img');
+                img.loading = 'lazy';
+                img.alt = '';
+                img.onerror = () => img.remove();
+                img.src = url;
+                div.appendChild(img);
+            }
+            return div;
+        }
+
+        // --- Library ---
+        async function fetchMedia(refresh = false) {
+            try {
+                const data = await api('/api/media' + (refresh ? '?refresh=1' : ''));
+                groups = data.groups;
+                renderChips(data.libraries);
+                renderGrid();
+                const note = document.getElementById('lib-count');
+                note.textContent = data.scanning ? 'scanning NAS...' : `${groups.length} titles`;
+                if (!data.posters_enabled && !data.scanning) note.textContent += ' · posters off (no TMDB key)';
+                if (data.posters_warming) note.textContent += ' · fetching posters...';
+                // Keep polling while the NAS scan or the poster warm-up is running so new art appears on its own.
+                if (data.scanning) setTimeout(() => fetchMedia(), 3000);
+                else if (data.posters_warming) setTimeout(() => fetchMedia(), 15000);
+            } catch (e) {
+                toast('Could not load library: ' + e.message, true);
+            }
+        }
+
+        function renderChips(libraries) {
+            const box = document.getElementById('chips');
+            if (box.childElementCount) return;
+            for (const lib of ['', ...libraries]) {
+                const b = document.createElement('button');
+                b.className = 'chip' + (lib === activeLibrary ? ' active' : '');
+                b.textContent = lib || 'All';
+                b.onclick = () => {
+                    activeLibrary = lib;
+                    box.querySelectorAll('.chip').forEach(c => c.classList.toggle('active', c === b));
+                    renderGrid();
+                };
+                box.appendChild(b);
+            }
+        }
+
+        function renderGrid() {
+            const terms = document.getElementById('search').value.toLowerCase().trim().split(/\s+/).filter(Boolean);
+            const matches = groups.filter(g =>
+                (!activeLibrary || g.library === activeLibrary) &&
+                terms.every(t => g.group.toLowerCase().includes(t) || g.title.toLowerCase().includes(t) ||
+                                 (terms.length && g.items.some(i => i.name.toLowerCase().includes(t))))
+            );
+            const grid = document.getElementById('grid');
+            const note = document.getElementById('grid-note');
+            grid.innerHTML = '';
+            note.textContent = '';
+            if (matches.length === 0) {
+                grid.innerHTML = `<div class="muted">${groups.length ? 'No matching titles.' : 'No videos found yet.'}</div>`;
+                return;
+            }
+            const frag = document.createDocumentFragment();
+            for (const g of matches.slice(0, MAX_CARDS)) {
+                const card = document.createElement('div');
+                card.className = 'card';
+                card.appendChild(posterEl(g.poster, g.title));
+                const meta = document.createElement('div');
+                meta.className = 'meta';
+                const title = document.createElement('div');
+                title.className = 'title';
+                title.textContent = g.title;
+                const sub = document.createElement('div');
+                sub.className = 'sub';
+                sub.textContent = [g.year, g.items.length > 1 ? `${g.items.length} files` : g.library].filter(Boolean).join(' · ');
+                meta.append(title, sub);
+                card.appendChild(meta);
+                card.onclick = () => openSheet(g);
+                frag.appendChild(card);
+            }
+            grid.appendChild(frag);
+            if (matches.length > MAX_CARDS) note.textContent = `Showing ${MAX_CARDS} of ${matches.length}. Keep typing to narrow it down.`;
+        }
+
+        // --- Detail sheet (pick which file to queue) ---
+        function openSheet(g) {
+            const sheet = document.getElementById('sheet');
+            sheet.innerHTML = '';
+            const head = document.createElement('div');
+            head.className = 'sheet-head';
+            head.appendChild(posterEl(g.poster, g.title));
+            const info = document.createElement('div');
+            const h3 = document.createElement('h3');
+            h3.textContent = g.title + (g.year ? ` (${g.year})` : '');
+            const sub = document.createElement('div');
+            sub.className = 'sub';
+            sub.style.color = '#888';
+            sub.textContent = `${g.library} · ${g.items.length} file${g.items.length === 1 ? '' : 's'}`;
+            info.append(h3, sub);
+            head.appendChild(info);
+            sheet.appendChild(head);
+
+            // Group episodes by season (items arrive sorted by season, then episode).
+            const seasons = [];
+            for (const item of g.items) {
+                const label = item.season || '';
+                let s = seasons[seasons.length - 1];
+                if (!s || s.label !== label) { s = {label, items: []}; seasons.push(s); }
+                s.items.push(item);
+            }
+            const addQueueAllRow = (label, items) => {
+                const episodes = items.filter(i => !i.extra);
+                const extras = items.length - episodes.length;
+                const row = document.createElement('div');
+                row.className = 'sheet-season';
+                const name = document.createElement('div');
+                name.className = 'season-name';
+                name.textContent = `${label} · ${episodes.length} episode${episodes.length === 1 ? '' : 's'}` + (extras ? ` + ${extras} extras` : '');
+                const btn = document.createElement('button');
+                btn.textContent = label === 'All' ? '＋ Queue all' : '＋ Queue season';
+                btn.disabled = episodes.length === 0;
+                btn.onclick = () => queueFiles(episodes, btn);
+                row.append(name, btn);
+                sheet.appendChild(row);
+            };
+            const hasSeasons = seasons.length > 1 || (seasons[0] && seasons[0].label);
+            if (!hasSeasons && g.items.length > 1) addQueueAllRow('All', g.items);
+            for (const s of seasons) {
+                if (hasSeasons) addQueueAllRow(s.label || 'Other', s.items);
+                for (const item of s.items) {
+                    const row = document.createElement('div');
+                    row.className = 'sheet-file';
+                    const name = document.createElement('div');
+                    name.className = 'name';
+                    name.textContent = (item.episode != null && hasSeasons && !item.extra ? `${item.episode}. ` : '') + item.file;
+                    if (item.extra) name.style.color = '#888';
+                    const btn = document.createElement('button');
+                    btn.className = 'primary';
+                    btn.textContent = '＋ Queue';
+                    btn.onclick = () => queueFile(item, btn);
+                    row.append(name, btn);
+                    sheet.appendChild(row);
+                }
+            }
+            sheet.classList.add('open');
+            document.getElementById('sheet-backdrop').classList.add('open');
+        }
+
+        function closeSheet() {
+            document.getElementById('sheet').classList.remove('open');
+            document.getElementById('sheet-backdrop').classList.remove('open');
+        }
+        document.getElementById('sheet-backdrop').onclick = closeSheet;
+
+        async function queueFile(item, btn) {
+            return queueFiles([item], btn);
+        }
+
+        async function queueFiles(items, btn) {
+            btn.disabled = true;
+            try {
+                const user = nameBox.value.trim();
+                const data = items.length === 1
+                    ? await api('/api/queue', {method: 'POST', body: JSON.stringify({id: items[0].id, user})})
+                    : await api('/api/queue/batch', {method: 'POST', body: JSON.stringify({ids: items.map(i => i.id), user})});
+                toast(data.message);
+                closeSheet();
+                refreshStatus();
+            } catch (e) {
+                toast(e.message, true);
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        // --- Now playing / queue ---
+        async function refreshStatus() {
+            if (dragging) return;
+            try {
+                const s = await api('/api/status');
+                document.getElementById('now-title').textContent = s.title || s.now_playing || 'Nothing playing';
+                document.getElementById('now-file').textContent = s.title ? s.now_playing : '';
+                document.getElementById('now-state').textContent =
+                    s.state + (s.length ? ` · ${fmtTime(s.time)} / ${fmtTime(s.length)}` : '');
+                document.getElementById('progress-bar').style.width = s.length ? (100 * s.time / s.length) + '%' : '0';
+                const np = document.getElementById('now-poster');
+                if (np.dataset.src !== (s.poster || '')) {
+                    np.dataset.src = s.poster || '';
+                    np.replaceWith(Object.assign(posterEl(s.poster, ''), {id: 'now-poster'}));
+                    document.getElementById('now-poster').dataset.src = s.poster || '';
+                }
+                renderQueue(s.queue, s.state);
+                renderQueueMeta(s);
+                const cur = s.queue.find(q => q.current);
+                const curId = s.state === 'stopped' ? null : (cur ? cur.id : null);
+                if (curId !== lastCurrentId) { lastCurrentId = curId; loadTracks(); }
+                else if (curId !== null && ++tracksRetry % 3 === 0) loadTracks();  // every ~9s: pick up the watcher's switches
+            } catch (e) {
+                document.getElementById('now-title').textContent = 'VLC unavailable';
+                document.getElementById('now-state').textContent = e.message;
+            }
+        }
+
+        // Total time left: rest of the current item plus every upcoming one.
+        function renderQueueMeta(s) {
+            const cur = s.queue.findIndex(q => q.current);
+            const upcoming = (s.state === 'stopped' || cur < 0) ? s.queue : s.queue.slice(cur + 1);
+            let total = upcoming.reduce((t, q) => t + Math.max(0, q.duration || 0), 0);
+            if (s.state !== 'stopped' && s.length) total += Math.max(0, s.length - s.time);
+            const parts = [];
+            if (upcoming.length) parts.push(`${upcoming.length} queued`);
+            if (total) parts.push(`${fmtDuration(total)} left`);
+            parts.push('drag ⠿ to reorder');
+            document.getElementById('queue-meta').textContent = parts.join(' · ');
+        }
+
+        // --- Audio / subtitle tracks ---
+        let tracksRetry = 0;
+        async function loadTracks(retry = 0) {
+            const row = document.getElementById('tracks');
+            if (lastCurrentId === null) { row.hidden = true; return; }
+            try {
+                const t = await api('/api/tracks');
+                const ready = ['audio', 'subtitle'].some(k => (t[k] || []).length > 1);
+                // Right after an episode starts VLC hasn't listed its tracks yet: keep what we have and retry.
+                if (!ready && retry < 10) { setTimeout(() => loadTracks(retry + 1), 1500); return; }
+                fillTracks(t);
+            } catch (e) {
+                row.hidden = true;  // VLC not launched with the custom HTTP folder, or nothing playing
+            }
+        }
+
+        function fillTracks(t) {
+            const row = document.getElementById('tracks');
+            let any = false;
+            for (const kind of ['audio', 'subtitle']) {
+                const sel = document.getElementById('track-' + kind);
+                const list = t[kind] || [];
+                const sig = JSON.stringify(list.map(tr => [tr.id, tr.name]));
+                if (sel.dataset.sig !== sig) {  // only rebuild when the track list itself changed
+                    sel.dataset.sig = sig;
+                    sel.innerHTML = '';
+                    for (const tr of list) {
+                        const opt = document.createElement('option');
+                        opt.value = tr.id;
+                        opt.textContent = tr.name.replace(/ - \[[^\]]*\]$/, '');  // "English 2.0 FLAC - [English]" -> "English 2.0 FLAC"
+                        sel.appendChild(opt);
+                    }
+                }
+                const current = list.find(tr => tr.current);
+                if (current && document.activeElement !== sel) sel.value = String(current.id);
+                sel.parentElement.hidden = list.length <= 1;
+                any = any || list.length > 1;
+            }
+            row.hidden = !any;
+            // What's remembered for this show (applied automatically to its other episodes).
+            const pref = document.getElementById('track-pref');
+            const p = t.pref || {};
+            const parts = [p.audio && `audio: ${p.audio.replace(/ - \[[^\]]*\]$/, '')}`, p.subtitle && `subs: ${p.subtitle.replace(/ - \[[^\]]*\]$/, '')}`].filter(Boolean);
+            pref.hidden = parts.length === 0;
+            pref.innerHTML = '';
+            if (parts.length) {
+                pref.append(`Remembered for ${p.title}: ${parts.join(', ')}`);
+                const a = document.createElement('a');
+                a.textContent = 'forget';
+                a.onclick = async () => { try { fillTracks(await api('/api/tracks/pref', {method: 'DELETE'})); } catch (e) { toast(e.message, true); } };
+                pref.appendChild(a);
+            }
+        }
+
+        for (const kind of ['audio', 'subtitle']) {
+            document.getElementById('track-' + kind).addEventListener('change', async (e) => {
+                try {
+                    const t = await api('/api/tracks', {method: 'POST', body: JSON.stringify({kind, id: Number(e.target.value)})});
+                    fillTracks(t);
+                    if (t.pref && t.pref.title) toast(`${kind === 'audio' ? 'Audio' : 'Subtitles'} remembered for ${t.pref.title}`);
+                } catch (err) { toast(err.message, true); }
+            });
+        }
+
+        function renderQueue(queue, state) {
+            if (dragging) return;
+            const container = document.getElementById('queue');
+            // Hide already-played items: show the current one and everything after it.
+            const cur = queue.findIndex(q => q.current);
+            const visible = (state === 'stopped' || cur < 0) ? queue : queue.slice(cur);
+            const key = JSON.stringify(visible.map(q => [q.id, q.current && state !== 'stopped', q.queued_by]));
+            if (container.dataset.key === key) return;  // nothing changed, don't disturb the DOM
+            container.dataset.key = key;
+            container.innerHTML = '';
+            if (!visible.length) { container.innerHTML = '<div class="muted">Queue is empty</div>'; return; }
+            for (const item of visible) {
+                const isCurrent = item.current && state !== 'stopped';
+                const div = document.createElement('div');
+                div.className = 'queue-item' + (isCurrent ? ' current' : '');
+                div.dataset.id = item.id;
+                const handle = document.createElement('span');
+                handle.className = 'handle';
+                handle.textContent = isCurrent ? '▶' : '⠿';
+                const text = document.createElement('div');
+                text.className = 'text';
+                const title = document.createElement('div');
+                title.className = 'title';
+                title.textContent = (item.title || item.name) + (item.duration > 0 ? ` · ${fmtTime(item.duration)}` : '');
+                const file = document.createElement('div');
+                file.className = 'file';
+                file.textContent = [item.title ? item.name : '', item.queued_by ? `queued by ${item.queued_by}` : ''].filter(Boolean).join(' · ');
+                text.append(title, file);
+                const btn = document.createElement('button');
+                btn.className = 'danger';
+                btn.textContent = '✕';
+                btn.title = 'Remove from queue';
+                btn.onclick = async () => {
+                    try { await api('/api/queue/' + item.id, {method: 'DELETE'}); container.dataset.key = ''; refreshStatus(); }
+                    catch (e) { toast(e.message, true); }
+                };
+                div.append(handle, posterEl(item.poster, '', 'thumb'), text, btn);
+                container.appendChild(div);
+            }
+        }
+
+        Sortable.create(document.getElementById('queue'), {
+            handle: '.handle',
+            filter: '.current',   // the playing item stays put
+            preventOnFilter: false,
+            animation: 150,
+            delay: 150, delayOnTouchOnly: true,   // let phones scroll without grabbing items
+            onMove: evt => !evt.related.classList.contains('current'),  // nothing goes above the playing item
+            onStart: () => { dragging = true; },
+            onEnd: async () => {
+                dragging = false;
+                const ids = [...document.querySelectorAll('#queue .queue-item:not(.current)')].map(d => Number(d.dataset.id));
+                try {
+                    await api('/api/queue/reorder', {method: 'POST', body: JSON.stringify({ids})});
+                } catch (e) {
+                    toast(e.message, true);
+                }
+                document.getElementById('queue').dataset.key = '';
+                refreshStatus();
+            },
+        });
+
+        document.querySelectorAll('.controls button').forEach(btn => {
+            btn.onclick = async () => {
+                try {
+                    await api('/api/control', {method: 'POST', body: JSON.stringify({action: btn.dataset.action})});
+                    setTimeout(refreshStatus, 300);
+                } catch (e) { toast(e.message, true); }
+            };
+        });
+
+        document.getElementById('search').addEventListener('input', renderGrid);
+
+        fetchMedia();
+        refreshStatus();
+        setInterval(refreshStatus, 3000);
+    </script>
+</body>
+</html>

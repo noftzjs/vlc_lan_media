@@ -1,0 +1,43 @@
+<?vlc --[[
+vim:syntax=lua
+tracks.json: lists the audio and subtitle tracks of the current input and which one is
+selected. Added by the LAN Projector Queue app; VLC's stock status.json only shows the
+streams that are currently decoding, with no ids, so there is no way to offer a switcher.
+
+> ?command=audio_track&val=<id>     select an audio track
+> ?command=subtitle_track&val=<id>  select a subtitle track (-1 disables)
+Both are the stock commands, processed before the listing is produced.
+]]?>
+<?vlc
+local httprequests = require "httprequests"
+httprequests.processcommands()
+
+local function encode_string(s)
+    s = tostring(s)
+    s = s:gsub('[%c"\\]', function(c)
+        if c == '"' then return '\\"' end
+        if c == '\\' then return '\\\\' end
+        if c == '\n' then return '\\n' end
+        return string.format('\\u%04x', c:byte())
+    end)
+    return '"' .. s .. '"'
+end
+
+local function track_list(input, var)
+    local out = {}
+    if not input then return out end
+    local ok, values, names = pcall(vlc.var.get_list, input, var)
+    if not ok or type(values) ~= "table" then return out end
+    local okc, current = pcall(vlc.var.get, input, var)
+    if not okc then current = nil end
+    for i, id in ipairs(values) do
+        table.insert(out, string.format('{"id":%d,"name":%s,"current":%s}',
+            tonumber(id) or -1, encode_string(names[i] or ("Track " .. i)), tostring(id == current)))
+    end
+    return out
+end
+
+local input = vlc.object.input()
+print('{"audio":[' .. table.concat(track_list(input, "audio-es"), ",") ..
+      '],"subtitle":[' .. table.concat(track_list(input, "spu-es"), ",") .. ']}')
+?>
