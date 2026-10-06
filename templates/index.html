@@ -63,10 +63,12 @@
         body.sortable-dragging { user-select: none; cursor: grabbing; }
 
         /* library */
-        .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+        .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
         .search-box { flex: 1 1 240px; padding: 12px; border-radius: 8px; border: 1px solid #333; background: #222; color: #fff; font-size: 1rem; }
-        .chip { background: #222; border: 1px solid #333; font-weight: normal; }
+        #chips { display: flex; gap: 8px; flex-wrap: wrap; }
+        .chip { background: #222; border: 1px solid #333; font-weight: normal; padding: 10px 14px; line-height: 1.2; }
         .chip.active { background: #ff5722; border-color: #ff5722; }
+        #sync { border-color: #444; }
         .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; }
         .card { background: #1e1e1e; border: 1px solid #2d2d2d; border-radius: 10px; overflow: hidden; cursor: pointer; display: flex; flex-direction: column; }
         .card:hover { border-color: #ff5722; }
@@ -131,7 +133,7 @@
     <div class="toolbar">
         <input type="text" id="search" class="search-box" placeholder="Search movies, TV shows, anime..." autocomplete="off">
         <div id="chips"></div>
-        <button id="sync" class="chip" title="Rescan this library on the NAS">⟳ Sync</button>
+        <button id="sync" class="chip" title="Rescan this library on the NAS">Sync</button>
     </div>
     <div class="grid" id="grid"><div class="muted">Loading NAS library...</div></div>
     <div class="muted" id="grid-note"></div>
@@ -239,7 +241,7 @@
 
         // Sync rescans just the selected library (or everything when "All" is selected).
         function updateSyncLabel() {
-            document.getElementById('sync').textContent = activeLibrary ? `⟳ Sync ${activeLibrary}` : '⟳ Sync all';
+            document.getElementById('sync').textContent = activeLibrary ? `Sync ${activeLibrary}` : 'Sync all';
         }
         document.getElementById('sync').onclick = () => {
             toast(activeLibrary ? `Rescanning ${activeLibrary}...` : 'Rescanning all libraries...');

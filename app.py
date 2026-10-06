@@ -532,23 +532,32 @@ def vlc(endpoint: str, **params) -> dict:
     return r.json()
 
 
+def filename_from_uri(uri: str) -> str:
+    return Path(unquote(urlparse(uri).path)).name if uri.startswith("file:") else ""
+
+
 def vlc_playlist() -> list[dict]:
     """Flatten VLC's playlist tree into the ordered list of queued items."""
     tree = vlc("playlist.json")
     nodes = tree.get("children", [])
     playlist_node = next((n for n in nodes if n.get("name") == "Playlist"), nodes[0] if nodes else {})
-    return [
-        {
+    items = []
+    for c in playlist_node.get("children", []):
+        if c.get("type") != "leaf":
+            continue
+        uri = c.get("uri", "")
+        # VLC swaps the item name for the file's embedded title tag once it pre-parses it, which can
+        # be empty or garbled. The real filename from the URI is what people recognise.
+        fname = filename_from_uri(uri)
+        items.append({
             "id": int(c["id"]),
-            "name": c.get("name", ""),
-            "uri": c.get("uri", ""),
+            "name": fname or c.get("name", ""),
+            "uri": uri,
             "duration": c.get("duration", -1),
             "current": c.get("current") == "current",
-            **library.describe(c.get("uri", "")),
-        }
-        for c in playlist_node.get("children", [])
-        if c.get("type") == "leaf"
-    ]
+            **library.describe(uri),
+        })
+    return items
 
 
 def current_show_key() -> tuple[str | None, dict | None]:
