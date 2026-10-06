@@ -96,6 +96,13 @@ folder with one extra file, `requests/tracks.json`. `start.ps1` points VLC at th
 `--lua-config "http={dir='...'}"`. If VLC was started some other way the dropdowns stay hidden
 and the watcher does nothing.
 
+## Syncing the library
+
+The NAS is scanned at startup and again whenever a library is older than `SCAN_TTL`. To pick up
+changes right away, select a library chip (TV Shows, Movies, …) and press **⟳ Sync**: only that
+folder is rescanned and swapped in, the others stay as they are. With *All* selected it rescans
+everything. The API form is `/api/media?refresh=TV%20Shows` or `?refresh=all`.
+
 ## Seasons and "Queue season"
 
 Opening a show lists its episodes grouped by season, each with a **Queue season** button next

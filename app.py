@@ -161,6 +161,8 @@ class Library:
         self.groups: list[dict] = []
         self.by_relpath: dict[tuple[str, str], dict] = {}  # (label, "rel/path.mkv" lowercased) -> group
         self.queued_by: dict[tuple[str, str], str] = {}  # same key -> name of whoever queued it last
+        self.scanned_at_by: dict[str, float] = {}  # label -> when that library was last scanned
+        self.scanning_labels: set[str] = set()
         # VLC reports mapped drives as UNC paths (file://TRUENAS/Plex/Movies/...), so remember both spellings.
         self.root_prefixes: dict[str, set[str]] = {}
         for label, root in self.roots.items():
@@ -170,24 +172,37 @@ class Library:
             except OSError:
                 pass
             self.root_prefixes[label] = {s.lower().strip("/") + "/" for s in spellings}
-        self.scanned_at: float | None = None
-        self.scanning = False
         self._lock = threading.Lock()
+
+    @property
+    def scanning(self) -> bool:
+        return bool(self.scanning_labels)
+
+    @property
+    def scanned_at(self) -> float | None:
+        """Oldest library scan time, or None until every library has been scanned once."""
+        if len(self.scanned_at_by) < len(self.roots):
+            return None
+        return min(self.scanned_at_by.values())
 
     @staticmethod
     def poster_url(label: str, group: str) -> str:
         return f"/api/poster/{quote(label, safe='')}/{quote(group, safe='')}"
 
-    def scan(self) -> None:
+    def scan(self, labels: set[str] | None = None) -> None:
+        """Scan the given libraries (default: all) and swap in their groups, leaving the others untouched."""
+        wanted = set(labels) if labels else set(self.roots)
         with self._lock:
-            if self.scanning:
+            todo = wanted - self.scanning_labels  # don't double-scan a library already in progress
+            if not todo:
                 return
-            self.scanning = True
+            self.scanning_labels |= todo
         try:
             started = time.time()
             groups: dict[tuple[str, str], dict] = {}
             by_relpath: dict[tuple[str, str], dict] = {}
-            for label, root in self.roots.items():
+            for label in sorted(todo):
+                root = self.roots[label]
                 if not root.is_dir():
                     log.warning("Media folder not found, skipping: %s", root)
                     continue
@@ -239,23 +254,27 @@ class Library:
                 ))
                 for it in g["items"]:
                     del it["_season_num"], it["_parent"]
-            ordered = sorted(groups.values(), key=lambda g: (g["library"].lower(), g["title"].lower()))
             with self._lock:
-                self.groups = ordered
-                self.by_relpath = by_relpath
-                self.scanned_at = time.time()
-            n_files = sum(len(g["items"]) for g in ordered)
-            log.info("Scanned %d video files in %d titles in %.1fs", n_files, len(ordered), time.time() - started)
+                kept = [g for g in self.groups if g["library"] not in todo]
+                self.groups = sorted(kept + list(groups.values()), key=lambda g: (g["library"].lower(), g["title"].lower()))
+                self.by_relpath = {k: v for k, v in self.by_relpath.items() if k[0] not in todo} | by_relpath
+                now = time.time()
+                for label in todo:
+                    self.scanned_at_by[label] = now
+            n_files = sum(len(g["items"]) for g in groups.values())
+            log.info("Scanned %s: %d video files in %d titles in %.1fs", ", ".join(sorted(todo)), n_files, len(groups), time.time() - started)
         finally:
             with self._lock:
-                self.scanning = False
+                self.scanning_labels -= todo
         posters.warm_in_background(self.groups)
 
-    def scan_in_background(self) -> None:
-        threading.Thread(target=self.scan, name="library-scan", daemon=True).start()
+    def scan_in_background(self, labels: set[str] | None = None) -> None:
+        threading.Thread(target=self.scan, args=(labels,), name="library-scan", daemon=True).start()
 
-    def is_stale(self) -> bool:
-        return self.scanned_at is None or time.time() - self.scanned_at > SCAN_TTL
+    def stale_labels(self) -> set[str]:
+        """Libraries never scanned, or scanned longer than SCAN_TTL ago."""
+        now = time.time()
+        return {label for label in self.roots if now - self.scanned_at_by.get(label, 0) > SCAN_TTL}
 
     def resolve(self, item_id: str) -> Path:
         """Turn a client-supplied id back into a real file, refusing anything outside the roots."""
@@ -625,15 +644,24 @@ def home():
 
 
 @app.get("/api/media")
-def list_media(refresh: bool = Query(False)):
+def list_media(refresh: str = Query("", description="'all' to rescan every library, or one library's name")):
     """Every title on the NAS with its files. Served from cache; rescans in the background when stale."""
-    if refresh or library.is_stale():
-        library.scan_in_background()
+    if refresh:
+        if refresh.lower() in ("1", "true", "all"):
+            library.scan_in_background()
+        elif refresh in library.roots:
+            library.scan_in_background({refresh})
+        else:
+            raise HTTPException(status_code=404, detail=f"Unknown library '{refresh}'.")
+    elif library.stale_labels():
+        library.scan_in_background(library.stale_labels())
     return {
         "groups": library.groups,
         "libraries": list(library.roots),
         "scanned_at": library.scanned_at,
+        "scanned_at_by": library.scanned_at_by,
         "scanning": library.scanning,
+        "scanning_libraries": sorted(library.scanning_labels),
         "posters_enabled": bool(TMDB_API_KEY),
         "posters_warming": posters.warming,
     }

@@ -59,6 +59,8 @@
         .queue-item .file { color: #888; font-size: .78rem; word-break: break-all; }
         .queue-item.sortable-ghost { opacity: .3; }
         .queue-item.sortable-chosen { background: #2a2a2a; }
+        .queue-item.sortable-fallback { opacity: .9; box-shadow: 0 4px 16px #000a; border-radius: 8px; }
+        body.sortable-dragging { user-select: none; cursor: grabbing; }
 
         /* library */
         .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -83,7 +85,10 @@
         .sheet-file { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0 8px 12px; border-top: 1px solid #2d2d2d; }
         .sheet-file .name { word-break: break-all; font-size: .9rem; }
         .sheet-season { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 0 6px; margin-top: 8px; border-top: 2px solid #333; }
+        .sheet-season.collapsible { cursor: pointer; user-select: none; }
+        .sheet-season.collapsible:hover .season-name { color: #ff8a65; }
         .sheet-season .season-name { font-weight: bold; color: #ff5722; }
+        .sheet-season .chevron { display: inline-block; width: 1.1em; color: #888; }
 
         #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #ff5722; color: #fff; padding: 12px 20px; border-radius: 8px; opacity: 0; transition: opacity .3s; pointer-events: none; max-width: 90vw; z-index: 20; }
         #toast.show { opacity: 1; }
@@ -126,6 +131,7 @@
     <div class="toolbar">
         <input type="text" id="search" class="search-box" placeholder="Search movies, TV shows, anime..." autocomplete="off">
         <div id="chips"></div>
+        <button id="sync" class="chip" title="Rescan this library on the NAS">⟳ Sync</button>
     </div>
     <div class="grid" id="grid"><div class="muted">Loading NAS library...</div></div>
     <div class="muted" id="grid-note"></div>
@@ -194,14 +200,15 @@
         }
 
         // --- Library ---
-        async function fetchMedia(refresh = false) {
+        async function fetchMedia(refresh = '') {
             try {
-                const data = await api('/api/media' + (refresh ? '?refresh=1' : ''));
+                const data = await api('/api/media' + (refresh ? '?refresh=' + encodeURIComponent(refresh) : ''));
                 groups = data.groups;
                 renderChips(data.libraries);
                 renderGrid();
                 const note = document.getElementById('lib-count');
-                note.textContent = data.scanning ? 'scanning NAS...' : `${groups.length} titles`;
+                note.textContent = data.scanning ? `scanning ${data.scanning_libraries.join(', ')}...` : `${groups.length} titles`;
+                document.getElementById('sync').disabled = data.scanning;
                 if (!data.posters_enabled && !data.scanning) note.textContent += ' · posters off (no TMDB key)';
                 if (data.posters_warming) note.textContent += ' · fetching posters...';
                 // Keep polling while the NAS scan or the poster warm-up is running so new art appears on its own.
@@ -223,10 +230,21 @@
                     activeLibrary = lib;
                     box.querySelectorAll('.chip').forEach(c => c.classList.toggle('active', c === b));
                     renderGrid();
+                    updateSyncLabel();
                 };
                 box.appendChild(b);
             }
+            updateSyncLabel();
         }
+
+        // Sync rescans just the selected library (or everything when "All" is selected).
+        function updateSyncLabel() {
+            document.getElementById('sync').textContent = activeLibrary ? `⟳ Sync ${activeLibrary}` : '⟳ Sync all';
+        }
+        document.getElementById('sync').onclick = () => {
+            toast(activeLibrary ? `Rescanning ${activeLibrary}...` : 'Rescanning all libraries...');
+            fetchMedia(activeLibrary || 'all');
+        };
 
         function renderGrid() {
             const terms = document.getElementById('search').value.toLowerCase().trim().split(/\s+/).filter(Boolean);
@@ -291,38 +309,57 @@
                 if (!s || s.label !== label) { s = {label, items: []}; seasons.push(s); }
                 s.items.push(item);
             }
-            const addQueueAllRow = (label, items) => {
+            // Season header with a Queue-season button; clicking the header collapses/expands its episodes.
+            const addSeasonRow = (label, items, collapsible, collapsed) => {
                 const episodes = items.filter(i => !i.extra);
                 const extras = items.length - episodes.length;
                 const row = document.createElement('div');
-                row.className = 'sheet-season';
+                row.className = 'sheet-season' + (collapsible ? ' collapsible' : '');
                 const name = document.createElement('div');
                 name.className = 'season-name';
-                name.textContent = `${label} · ${episodes.length} episode${episodes.length === 1 ? '' : 's'}` + (extras ? ` + ${extras} extras` : '');
+                const chevron = document.createElement('span');
+                chevron.className = 'chevron';
+                chevron.textContent = collapsed ? '▸' : '▾';
+                if (collapsible) name.appendChild(chevron);
+                name.append(`${label} · ${episodes.length} episode${episodes.length === 1 ? '' : 's'}` + (extras ? ` + ${extras} extras` : ''));
                 const btn = document.createElement('button');
                 btn.textContent = label === 'All' ? '＋ Queue all' : '＋ Queue season';
                 btn.disabled = episodes.length === 0;
-                btn.onclick = () => queueFiles(episodes, btn);
+                btn.onclick = (e) => { e.stopPropagation(); queueFiles(episodes, btn); };
                 row.append(name, btn);
                 sheet.appendChild(row);
+                const body = document.createElement('div');
+                body.className = 'season-eps';
+                body.hidden = collapsed;
+                sheet.appendChild(body);
+                if (collapsible) row.onclick = () => { body.hidden = !body.hidden; chevron.textContent = body.hidden ? '▸' : '▾'; };
+                return body;
+            };
+            const addEpisodeRow = (parent, item, numbered) => {
+                const row = document.createElement('div');
+                row.className = 'sheet-file';
+                const name = document.createElement('div');
+                name.className = 'name';
+                name.textContent = (item.episode != null && numbered && !item.extra ? `${item.episode}. ` : '') + item.file;
+                if (item.extra) name.style.color = '#888';
+                const btn = document.createElement('button');
+                btn.className = 'primary';
+                btn.textContent = '＋ Queue';
+                btn.onclick = () => queueFile(item, btn);
+                row.append(name, btn);
+                parent.appendChild(row);
             };
             const hasSeasons = seasons.length > 1 || (seasons[0] && seasons[0].label);
-            if (!hasSeasons && g.items.length > 1) addQueueAllRow('All', g.items);
-            for (const s of seasons) {
-                if (hasSeasons) addQueueAllRow(s.label || 'Other', s.items);
-                for (const item of s.items) {
-                    const row = document.createElement('div');
-                    row.className = 'sheet-file';
-                    const name = document.createElement('div');
-                    name.className = 'name';
-                    name.textContent = (item.episode != null && hasSeasons && !item.extra ? `${item.episode}. ` : '') + item.file;
-                    if (item.extra) name.style.color = '#888';
-                    const btn = document.createElement('button');
-                    btn.className = 'primary';
-                    btn.textContent = '＋ Queue';
-                    btn.onclick = () => queueFile(item, btn);
-                    row.append(name, btn);
-                    sheet.appendChild(row);
+            if (!hasSeasons) {
+                // One flat list: collapsible only when it's long, and open by default.
+                const parent = g.items.length > 1 ? addSeasonRow('All', g.items, g.items.length > 12, false) : sheet;
+                for (const item of g.items) addEpisodeRow(parent, item, false);
+            } else {
+                // Several seasons start collapsed so a long show opens as a short list of seasons.
+                const collapsed = seasons.length > 1;
+                for (const s of seasons) {
+                    const body = addSeasonRow(s.label || 'Other', s.items, true, collapsed);
+                    for (const item of s.items) addEpisodeRow(body, item, true);
                 }
             }
             sheet.classList.add('open');
@@ -508,10 +545,17 @@
             preventOnFilter: false,
             animation: 150,
             delay: 150, delayOnTouchOnly: true,   // let phones scroll without grabbing items
+            // The queue panel scrolls internally. Native HTML5 drag won't auto-scroll a nested panel,
+            // so use Sortable's fallback drag with its own auto-scroll when near the top/bottom edge.
+            forceFallback: true,
+            fallbackTolerance: 3,
+            forceAutoScrollFallback: true,
+            scroll: true, scrollSensitivity: 80, scrollSpeed: 12, bubbleScroll: true,
             onMove: evt => !evt.related.classList.contains('current'),  // nothing goes above the playing item
-            onStart: () => { dragging = true; },
+            onStart: () => { dragging = true; document.body.classList.add('sortable-dragging'); },
             onEnd: async () => {
                 dragging = false;
+                document.body.classList.remove('sortable-dragging');
                 const ids = [...document.querySelectorAll('#queue .queue-item:not(.current)')].map(d => Number(d.dataset.id));
                 try {
                     await api('/api/queue/reorder', {method: 'POST', body: JSON.stringify({ids})});
