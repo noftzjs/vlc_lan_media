@@ -206,7 +206,8 @@
         }
 
         async function api(path, options = {}) {
-            if (options.body && !options.headers) options.headers = {'Content-Type': 'application/json'};
+            // JSON bodies get the header; FormData must be left alone so the browser sets the multipart boundary.
+            if (typeof options.body === 'string' && !options.headers) options.headers = {'Content-Type': 'application/json'};
             const res = await fetch(path, options);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
@@ -659,18 +660,22 @@
                 const sub = document.createElement('div');
                 sub.className = 'file';
                 sub.textContent = p.status === 'error' ? `Failed: ${p.error}`
+                    : p.status === 'cancelled' ? 'Download cancelled'
                     : p.status === 'queued' ? 'Downloaded, added to queue'
                     : `Fetching from YouTube · ${Math.round(p.percent)}%` + (p.eta ? ` · ${p.eta} left` : '') + (p.user ? ` · queued by ${p.user}` : '');
                 text.append(title, sub);
                 div.append(icon, posterEl(p.thumbnail, '', 'thumb'), text);
-                if (p.status === 'error') {
+                if (p.status === 'error' || p.status === 'fetching') {
                     const btn = document.createElement('button');
                     btn.className = 'danger';
                     btn.textContent = '✕';
-                    btn.title = 'Dismiss';
+                    btn.title = p.status === 'fetching' ? 'Cancel download' : 'Dismiss';
                     btn.onclick = async () => {
-                        try { await api('/api/youtube/jobs/' + p.id, {method: 'DELETE'}); container.dataset.key = ''; refreshStatus(); }
-                        catch (e) { toast(e.message, true); }
+                        try {
+                            const data = await api('/api/youtube/jobs/' + p.id, {method: 'DELETE'});
+                            if (p.status === 'fetching') toast(data.message);
+                            container.dataset.key = ''; refreshStatus();
+                        } catch (e) { toast(e.message, true); }
                     };
                     div.appendChild(btn);
                 }

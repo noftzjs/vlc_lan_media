@@ -125,10 +125,12 @@ _META = "META\t%(id)s\t%(title)s\t%(duration)s\t%(uploader)s\t%(thumbnail)s\t%(i
 _PROGRESS = "PROGRESS\t%(progress._percent_str)s\t%(progress._eta_str)s"
 
 
-def download(url: str, on_progress: Callable[[dict], None] | None = None, timeout: int = 1800) -> dict:
+def download(url: str, on_progress: Callable[[dict], None] | None = None, timeout: int = 1800,
+             handle: dict | None = None) -> dict:
     """Download (or reuse from cache) one video merged into a single file. Returns metadata + 'path'.
 
-    on_progress is called with {"percent": float, "eta": str} as the download runs.
+    on_progress is called with {"percent": float, "eta": str} as the download runs. If `handle`
+    is given, handle["proc"] is set to the yt-dlp process so a caller can cancel() it.
     """
     if not YTDLP:
         raise HTTPException(status_code=501, detail="yt-dlp is not installed (pip install yt-dlp[default]).")
@@ -146,6 +148,8 @@ def download(url: str, on_progress: Callable[[dict], None] | None = None, timeou
                                 encoding="utf-8", errors="replace")
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"Could not start yt-dlp: {e}")
+    if handle is not None:
+        handle["proc"] = proc
     meta: dict = {}
     path = ""
     started = time.time()
@@ -172,10 +176,38 @@ def download(url: str, on_progress: Callable[[dict], None] | None = None, timeou
             raise HTTPException(status_code=504, detail="Download took too long.")
     stderr = proc.stderr.read()
     proc.wait()
+    if handle is not None and handle.get("cancelled"):
+        discard_partial(meta.get("id"))
+        raise HTTPException(status_code=409, detail="Download cancelled.")
     if proc.returncode != 0 or not path or not Path(path).exists():
         raise _fail(stderr, "Download failed")
     meta["path"] = path
     return meta
+
+
+def cancel(handle: dict) -> bool:
+    """Kill a running download (yt-dlp and the ffmpeg it spawned). Returns True if something was killed."""
+    proc = handle.get("proc")
+    if proc is None or proc.poll() is not None:
+        return False
+    handle["cancelled"] = True
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, check=False)
+    else:
+        proc.kill()
+    return True
+
+
+def discard_partial(video_id: str | None) -> None:
+    """Remove the leftovers (.part, .ytdl, separate streams) of a cancelled download."""
+    if not video_id or not CACHE_DIR.exists():
+        return
+    for f in CACHE_DIR.glob(f"{video_id}.*"):
+        if f.suffix in (".part", ".ytdl") or ".f" in f.name:  # x.f137.mp4.part, x.f140.m4a, x.mkv.part
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
 
 def trim_cache(keep: set[str] = frozenset()) -> None:

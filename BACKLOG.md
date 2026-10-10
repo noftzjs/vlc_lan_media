@@ -17,6 +17,7 @@
 - [x] Research: streaming YouTube's separate audio into VLC gives no sound; downloading + merging does work
 - [x] YouTube chip: search or pasted link (from any library), thumbnails, Queue
 - [x] Background download with progress in Up next, cached in cache/youtube, auto-queued when done
+- [x] Cancel a running download from Up next
 - [ ] Try it at a party: watch for yt-dlp breakage (start.ps1 updates it) and long-video download times
 - [ ] Optional: cap quality at 720p for videos over 30 min to shorten the wait
 

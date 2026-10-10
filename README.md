@@ -117,7 +117,9 @@ because YouTube changes often and yt-dlp breaks until updated. ffmpeg must be on
 on this PC).
 
 Needs internet on the projector PC, and thumbnails are loaded from YouTube by guests' phones.
-Age-restricted videos won't download (no login). At most three downloads run at once.
+Age-restricted videos won't download (no login). At most three downloads run at once. A
+download in progress has a ✕ in Up next that kills it and removes the partial file, for when
+someone queues a five-hour stream.
 
 ## Pictures on the projector
 
@@ -126,6 +128,11 @@ show (10s to 5 minutes, or until skipped), and it joins the queue like a video. 
 stills natively, so memes, scoreboards and "pizza is here" notes just work. JPG, PNG, GIF,
 WebP and BMP up to `IMAGE_MAX_MB` (25). Uploads sit in `cache/images/` and are deleted after
 `IMAGE_KEEP_DAYS` (2) unless still queued.
+
+Every still is re-encoded by ffmpeg into a PNG no larger than 1920x1080 before queueing:
+VLC's still-image module rejects WebP (which Reddit/Discord often serve, even with a .jpg
+name) and very large JPEGs, showing one frame and ending. Animated GIFs are kept as-is and
+looped for the requested time.
 
 ## Syncing the library
 

@@ -8,8 +8,11 @@ to the projector) through VLC's built-in HTTP interface.
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -521,6 +524,35 @@ track_prefs = TrackPrefs()
 extra_items: dict[str, dict] = {}  # lowercased local path -> {title, name, poster, queued_by, options, youtube?}
 yt_jobs: dict[str, dict] = {}  # job id -> {url, title, user, percent, eta, status, error, started}
 yt_lock = threading.Lock()
+EXTRA_ITEMS_FILE = BASE_DIR / "cache" / "extra_items.json"  # survives server restarts
+
+
+def _load_extra_items() -> None:
+    if not EXTRA_ITEMS_FILE.exists():
+        return
+    try:
+        data = json.loads(EXTRA_ITEMS_FILE.read_text("utf-8"))
+    except ValueError:
+        return
+    # Drop entries whose file is gone (cache trimmed) so the table doesn't grow forever.
+    extra_items.update({k: v for k, v in data.items() if Path(k).exists()})
+
+
+def _save_extra_items() -> None:
+    try:
+        EXTRA_ITEMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        EXTRA_ITEMS_FILE.write_text(json.dumps(extra_items, indent=0), "utf-8")
+    except OSError as e:
+        log.warning("Could not save extra items: %s", e)
+
+
+def remember_extra_item(path: Path, info: dict) -> None:
+    with yt_lock:
+        extra_items[_path_key(str(path))] = info
+        _save_extra_items()
+
+
+_load_extra_items()
 IMAGE_DIR = BASE_DIR / "cache" / "images"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -534,9 +566,6 @@ def _path_key(path_or_uri: str) -> str:
         p = unquote(u.path)
         path_or_uri = f"//{u.netloc}{p}" if u.netloc else p.lstrip("/")
     return path_or_uri.replace("\\", "/").lower().strip("/")
-
-
-_yt_key = _path_key  # kept for readability where YouTube paths are meant
 
 
 def extra_lookup(uri: str) -> dict | None:
@@ -577,6 +606,38 @@ def enqueue_uri(uri: str) -> None:
     vlc("status.json", **params)
 
 
+def _ffprobe_gif(path: Path) -> tuple[float, int]:
+    """(duration seconds, frame count) of a GIF, or (0, 1) if ffprobe can't tell."""
+    try:
+        ffprobe = shutil.which("ffprobe") or (str(Path(youtube.FFMPEG).with_name("ffprobe.exe")) if youtube.FFMPEG else "ffprobe")
+        r = subprocess.run([ffprobe, "-v", "error",
+                            "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames:format=duration",
+                            "-of", "default=noprint_wrappers=1", str(path)], capture_output=True, text=True, timeout=60, check=False)
+        kv = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        frames = int(kv.get("nb_read_frames", "1")) if kv.get("nb_read_frames", "1").isdigit() else 1
+        duration = float(kv.get("duration", "0")) if kv.get("duration", "N/A") != "N/A" else 0.0
+        return duration, frames
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0, 1
+
+
+def normalize_image(src: Path, dest: Path) -> None:
+    """Re-encode any upload into a PNG that VLC's still-image module accepts.
+
+    VLC 3's image demuxer refuses WebP and very large JPEGs (it hands them to the generic video
+    demuxer, which shows one frame and ends). ffmpeg turns anything into a PNG no bigger than
+    1920x1080, which also keeps the thumbnail light.
+    """
+    cmd = [youtube.FFMPEG or "ffmpeg", "-v", "error", "-y", "-i", str(src), "-frames:v", "1",
+           "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease", str(dest)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {e}")
+    if r.returncode != 0 or not dest.exists():
+        raise HTTPException(status_code=400, detail="Couldn't read that image file.")
+
+
 def play_last_if_idle(was_idle: bool) -> bool:
     if was_idle:
         items = vlc_playlist()
@@ -597,14 +658,13 @@ def yt_fetch_and_queue(job_id: str) -> None:
             job["thumbnail"] = p["meta"].get("thumbnail")
 
     try:
-        meta = youtube.download(job["url"], progress)
+        meta = youtube.download(job["url"], progress, handle=job)
         path = Path(meta["path"])
-        with yt_lock:
-            extra_items[_yt_key(str(path))] = {
-                "title": meta["title"], "name": meta.get("uploader") or "YouTube", "poster": meta.get("thumbnail"),
-                "queued_by": job["user"] or None, "duration": meta.get("duration") or 0,
-                "youtube": meta["url"], "options": [],
-            }
+        remember_extra_item(path, {
+            "title": meta["title"], "name": meta.get("uploader") or "YouTube", "poster": meta.get("thumbnail"),
+            "queued_by": job["user"] or None, "duration": meta.get("duration") or 0,
+            "youtube": meta["url"], "options": [],
+        })
         was_idle = vlc("status.json").get("state") == "stopped"
         enqueue_uri(path.as_uri())
         play_last_if_idle(was_idle)
@@ -617,9 +677,12 @@ def yt_fetch_and_queue(job_id: str) -> None:
         except OSError:
             pass
     except HTTPException as e:
-        job.update({"status": "error", "error": e.detail})
+        job.update({"status": "cancelled" if job.get("cancelled") else "error", "error": e.detail})
     except Exception as e:  # keep the job table sane whatever happens
-        job.update({"status": "error", "error": str(e)[:200]})
+        job.update({"status": "cancelled" if job.get("cancelled") else "error", "error": str(e)[:200]})
+    job.pop("proc", None)
+    if job["status"] == "cancelled":
+        log.info("YouTube fetch cancelled: %s", job["title"])
     if job["status"] == "error":
         log.warning("YouTube fetch failed for %s: %s", job["url"], job["error"])
         try:
@@ -632,7 +695,7 @@ def yt_fetch_and_queue(job_id: str) -> None:
 
 # Finished jobs leave the pending list quickly (the real queue item has appeared); failures stay
 # long enough to be read, or until dismissed.
-YT_JOB_LINGER = {"queued": 3, "error": 90}
+YT_JOB_LINGER = {"queued": 3, "error": 90, "cancelled": 5}
 
 
 def yt_pending() -> list[dict]:
@@ -888,15 +951,28 @@ async def queue_image(file: UploadFile = File(...), user: str = Form(""), durati
         raise HTTPException(status_code=400, detail="Empty file.")
     name = re.sub(r"\s+", " ", user).strip()[:40]
     # One file per upload: the same picture queued twice with different titles/durations must not collide.
-    stored = IMAGE_DIR / f"{int(time.time() * 1000):x}_{hashlib.sha1(data).hexdigest()[:8]}{ext}"
-    stored.write_bytes(data)
+    stem = f"{int(time.time() * 1000):x}_{hashlib.sha1(data).hexdigest()[:8]}"
+    raw = IMAGE_DIR / f"{stem}.upload{ext}"
+    raw.write_bytes(data)
+    options: list[str]
+    if ext == ".gif" and (gif := _ffprobe_gif(raw))[1] > 1 and gif[0] > 0.2:
+        # Animated GIF: VLC plays it as a tiny video, so loop it for the requested time.
+        stored = raw.rename(IMAGE_DIR / f"{stem}.gif")
+        repeats = 65535 if duration == -1 else max(0, math.ceil(duration / gif[0]) - 1)
+        options = [f"input-repeat={repeats}"]
+    else:
+        stored = IMAGE_DIR / f"{stem}.png"
+        try:
+            normalize_image(raw, stored)
+        finally:
+            raw.unlink(missing_ok=True)
+        options = [f"image-duration={duration}"]
     title = Path(file.filename).stem[:80] or "Image"
     shown = "until skipped" if duration == -1 else f"{duration}s"
-    with yt_lock:
-        extra_items[_path_key(str(stored))] = {
-            "title": title, "name": f"Image · {shown}", "poster": f"/images/{stored.name}", "queued_by": name or None,
-            "duration": 0 if duration == -1 else duration, "image": True, "options": [f"image-duration={duration}"],
-        }
+    remember_extra_item(stored, {
+        "title": title, "name": f"Image · {shown}", "poster": f"/images/{stored.name}", "queued_by": name or None,
+        "duration": 0 if duration == -1 else duration, "image": True, "options": options,
+    })
     was_idle = vlc("status.json").get("state") == "stopped"
     enqueue_uri(stored.as_uri())
     log.info("Queued by %s: image %s (%s)", name or "anonymous", title, shown)
@@ -913,11 +989,17 @@ async def queue_image(file: UploadFile = File(...), user: str = Form(""), durati
 
 @app.delete("/api/youtube/jobs/{job_id}")
 def dismiss_youtube_job(job_id: str):
-    """Dismiss a finished or failed download notice (a running download can't be cancelled)."""
+    """Cancel a running download, or dismiss a finished/failed notice."""
     with yt_lock:
         job = yt_jobs.get(job_id)
-        if job and job["status"] != "fetching":
-            del yt_jobs[job_id]
+        if not job:
+            return {"message": "ok"}
+        if job["status"] == "fetching":
+            if youtube.cancel(job):
+                return {"message": f"Cancelled: {job['title']}"}
+            job["cancelled"] = True  # not started yet; the worker will see the flag
+            return {"message": "Cancelling..."}
+        del yt_jobs[job_id]
     return {"message": "ok"}
 
 
