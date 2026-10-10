@@ -57,10 +57,22 @@
         .queue-item .text { flex: 1; min-width: 0; }
         .queue-item .title { font-weight: bold; }
         .queue-item .file { color: #888; font-size: .78rem; word-break: break-all; }
+        .queue-item.pending { opacity: .75; }
+        .queue-item.pending .handle { cursor: default; color: #ff5722; }
+        .queue-item.pending.error .handle { color: #e53935; }
         .queue-item.sortable-ghost { opacity: .3; }
         .queue-item.sortable-chosen { background: #2a2a2a; }
         .queue-item.sortable-fallback { opacity: .9; box-shadow: 0 4px 16px #000a; border-radius: 8px; }
         body.sortable-dragging { user-select: none; cursor: grabbing; }
+
+        /* image drop zone */
+        .dropzone { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; border: 2px dashed #3a3a3a; transition: border-color .15s, background .15s; }
+        .dropzone.over { border-color: #ff5722; background: #2a1d18; }
+        .dropzone.busy { opacity: .6; pointer-events: none; }
+        .drop-text { color: #bbb; }
+        .drop-text a { color: #ff5722; cursor: pointer; text-decoration: underline; }
+        .drop-duration { display: flex; align-items: center; gap: 6px; color: #999; font-size: .9rem; }
+        .drop-duration select { background: #222; color: #fff; border: 1px solid #333; border-radius: 6px; padding: 6px 8px; font-size: .9rem; color-scheme: dark; }
 
         /* library */
         .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
@@ -73,6 +85,9 @@
         .card { background: #1e1e1e; border: 1px solid #2d2d2d; border-radius: 10px; overflow: hidden; cursor: pointer; display: flex; flex-direction: column; }
         .card:hover { border-color: #ff5722; }
         .card .poster { width: 100%; aspect-ratio: 2 / 3; border-radius: 0; font-size: .9rem; color: #777; }
+        .card.wide .poster { aspect-ratio: 16 / 9; }
+        .grid.wide { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+        .chip.yt.active { background: #e53935; border-color: #e53935; }
         .card .meta { padding: 8px; }
         .card .title { font-weight: bold; font-size: .9rem; line-height: 1.2; }
         .card .sub { color: #888; font-size: .75rem; margin-top: 3px; }
@@ -129,6 +144,22 @@
     <h2>Up next <small id="queue-meta">drag ⠿ to reorder</small></h2>
     <div class="panel" id="queue"><div class="muted">Queue is empty</div></div>
 
+    <h2>Show a picture <small>memes, scoreboards, info</small></h2>
+    <div class="panel dropzone" id="dropzone">
+        <input type="file" id="image-file" accept="image/*" hidden>
+        <div class="drop-text"><strong>Drop an image here</strong> or <a id="image-pick">tap to choose one</a></div>
+        <label class="drop-duration">Show for
+            <select id="image-duration">
+                <option value="10">10 seconds</option>
+                <option value="15" selected>15 seconds</option>
+                <option value="30">30 seconds</option>
+                <option value="60">1 minute</option>
+                <option value="300">5 minutes</option>
+                <option value="-1">until skipped</option>
+            </select>
+        </label>
+    </div>
+
     <h2>Library <small id="lib-count"></small></h2>
     <div class="toolbar">
         <input type="text" id="search" class="search-box" placeholder="Search movies, TV shows, anime..." autocomplete="off">
@@ -145,7 +176,11 @@
     <script src="/static/Sortable.min.js"></script>
     <script>
         let groups = [];
-        let activeLibrary = '';
+        let activeLibrary = '';       // '' = all, a library name, or YT for YouTube search
+        const YT = '__youtube__';
+        let ytResults = [];
+        let ytTimer = null;
+        let ytEnabled = false;
         let dragging = false;
         let toastTimer;
         let lastCurrentId = null;
@@ -167,7 +202,7 @@
             el.textContent = msg;
             el.className = 'show' + (isError ? ' error' : '');
             clearTimeout(toastTimer);
-            toastTimer = setTimeout(() => el.className = '', 3000);
+            toastTimer = setTimeout(() => el.className = '', isError ? 7000 : 3000);  // errors stay long enough to read
         }
 
         async function api(path, options = {}) {
@@ -206,6 +241,7 @@
             try {
                 const data = await api('/api/media' + (refresh ? '?refresh=' + encodeURIComponent(refresh) : ''));
                 groups = data.groups;
+                ytEnabled = !!data.youtube_enabled;
                 renderChips(data.libraries);
                 renderGrid();
                 const note = document.getElementById('lib-count');
@@ -224,24 +260,117 @@
         function renderChips(libraries) {
             const box = document.getElementById('chips');
             if (box.childElementCount) return;
-            for (const lib of ['', ...libraries]) {
+            for (const lib of ['', ...libraries, ...(ytEnabled ? [YT] : [])]) {
                 const b = document.createElement('button');
-                b.className = 'chip' + (lib === activeLibrary ? ' active' : '');
-                b.textContent = lib || 'All';
+                b.className = 'chip' + (lib === YT ? ' yt' : '') + (lib === activeLibrary ? ' active' : '');
+                b.textContent = lib === YT ? 'YouTube' : (lib || 'All');
                 b.onclick = () => {
                     activeLibrary = lib;
                     box.querySelectorAll('.chip').forEach(c => c.classList.toggle('active', c === b));
-                    renderGrid();
                     updateSyncLabel();
+                    if (lib === YT) { document.getElementById('search').focus(); searchYouTube(); } else renderGrid();
                 };
                 box.appendChild(b);
             }
             updateSyncLabel();
         }
 
-        // Sync rescans just the selected library (or everything when "All" is selected).
+        // Sync rescans just the selected library (or everything when "All" is selected). Hidden for YouTube.
         function updateSyncLabel() {
+            const isYt = activeLibrary === YT;
+            document.getElementById('sync').hidden = isYt;
             document.getElementById('sync').textContent = activeLibrary ? `Sync ${activeLibrary}` : 'Sync all';
+            document.getElementById('search').placeholder = isYt ? 'Search YouTube or paste a link...' : 'Search movies, TV shows, anime...';
+        }
+
+        // --- YouTube ---
+        async function searchYouTube() {
+            const q = document.getElementById('search').value.trim();
+            const grid = document.getElementById('grid');
+            document.getElementById('grid-note').textContent = '';
+            if (q.length < 3) { ytResults = []; grid.className = 'grid wide'; grid.innerHTML = '<div class="muted">Type to search YouTube, or paste a video link.</div>'; return; }
+            grid.className = 'grid wide';
+            grid.innerHTML = '<div class="muted">Searching YouTube...</div>';
+            try {
+                const data = await api('/api/youtube/search?q=' + encodeURIComponent(q));
+                if (activeLibrary !== YT || document.getElementById('search').value.trim() !== q) return;  // stale
+                ytResults = data.results;
+                renderYouTube();
+            } catch (e) {
+                grid.innerHTML = `<div class="muted">${e.message}</div>`;
+            }
+        }
+
+        function renderYouTube() {
+            const grid = document.getElementById('grid');
+            grid.className = 'grid wide';
+            grid.innerHTML = '';
+            if (!ytResults.length) { grid.innerHTML = '<div class="muted">No results.</div>'; return; }
+            for (const v of ytResults) {
+                const card = document.createElement('div');
+                card.className = 'card wide';
+                card.appendChild(posterEl(v.thumbnail, v.title));
+                const meta = document.createElement('div');
+                meta.className = 'meta';
+                const title = document.createElement('div');
+                title.className = 'title';
+                title.textContent = v.title;
+                const sub = document.createElement('div');
+                sub.className = 'sub';
+                sub.textContent = [v.uploader, v.live ? 'LIVE' : (v.duration ? fmtTime(v.duration) : '')].filter(Boolean).join(' · ');
+                meta.append(title, sub);
+                card.appendChild(meta);
+                card.onclick = () => openYouTubeSheet(v);
+                grid.appendChild(card);
+            }
+        }
+
+        function openYouTubeSheet(v) {
+            const sheet = document.getElementById('sheet');
+            sheet.innerHTML = '';
+            const head = document.createElement('div');
+            head.className = 'sheet-head';
+            const thumb = posterEl(v.thumbnail, v.title);
+            thumb.style.width = '160px'; thumb.style.height = '90px';
+            head.appendChild(thumb);
+            const info = document.createElement('div');
+            const h3 = document.createElement('h3');
+            h3.textContent = v.title;
+            const sub = document.createElement('div');
+            sub.style.color = '#888';
+            sub.textContent = [v.uploader, v.live ? 'LIVE' : (v.duration ? fmtTime(v.duration) : ''), 'YouTube'].filter(Boolean).join(' · ');
+            info.append(h3, sub);
+            head.appendChild(info);
+            sheet.appendChild(head);
+            const row = document.createElement('div');
+            row.className = 'sheet-file';
+            const name = document.createElement('div');
+            name.className = 'name';
+            name.textContent = v.url;
+            const btn = document.createElement('button');
+            btn.className = 'primary';
+            btn.textContent = '＋ Queue';
+            btn.onclick = async () => {
+                btn.disabled = true;
+                try {
+                    const data = await api('/api/queue/youtube', {method: 'POST', body: JSON.stringify({url: v.url, user: nameBox.value.trim(), title: v.title})});
+                    toast(data.message + ' — it joins the queue when the download finishes');
+                    closeSheet();
+                    // Start fresh for the next person: clear the search and the results.
+                    document.getElementById('search').value = '';
+                    ytResults = [];
+                    renderGrid();
+                    refreshStatus();
+                } catch (e) {
+                    toast(e.message, true);
+                } finally {
+                    btn.disabled = false;
+                }
+            };
+            row.append(name, btn);
+            sheet.appendChild(row);
+            sheet.classList.add('open');
+            document.getElementById('sheet-backdrop').classList.add('open');
         }
         document.getElementById('sync').onclick = () => {
             toast(activeLibrary ? `Rescanning ${activeLibrary}...` : 'Rescanning all libraries...');
@@ -249,6 +378,8 @@
         };
 
         function renderGrid() {
+            if (activeLibrary === YT) { renderYouTube(); return; }
+            document.getElementById('grid').className = 'grid';
             const terms = document.getElementById('search').value.toLowerCase().trim().split(/\s+/).filter(Boolean);
             const matches = groups.filter(g =>
                 (!activeLibrary || g.library === activeLibrary) &&
@@ -411,7 +542,7 @@
                     np.replaceWith(Object.assign(posterEl(s.poster, ''), {id: 'now-poster'}));
                     document.getElementById('now-poster').dataset.src = s.poster || '';
                 }
-                renderQueue(s.queue, s.state);
+                renderQueue(s.queue, s.state, s.pending || []);
                 renderQueueMeta(s);
                 const cur = s.queue.find(q => q.current);
                 const curId = s.state === 'stopped' ? null : (cur ? cur.id : null);
@@ -500,17 +631,54 @@
             });
         }
 
-        function renderQueue(queue, state) {
+        function renderQueue(queue, state, pending = []) {
             if (dragging) return;
             const container = document.getElementById('queue');
             // Hide already-played items: show the current one and everything after it.
             const cur = queue.findIndex(q => q.current);
             const visible = (state === 'stopped' || cur < 0) ? queue : queue.slice(cur);
-            const key = JSON.stringify(visible.map(q => [q.id, q.current && state !== 'stopped', q.queued_by]));
+            const key = JSON.stringify([visible.map(q => [q.id, q.current && state !== 'stopped', q.queued_by]),
+                                        pending.map(p => [p.id, Math.round(p.percent), p.status])]);
             if (container.dataset.key === key) return;  // nothing changed, don't disturb the DOM
             container.dataset.key = key;
             container.innerHTML = '';
-            if (!visible.length) { container.innerHTML = '<div class="muted">Queue is empty</div>'; return; }
+            if (!visible.length && !pending.length) { container.innerHTML = '<div class="muted">Queue is empty</div>'; return; }
+            renderQueueItems(container, visible, state);
+            // YouTube downloads in progress sit at the bottom until they join the real queue.
+            for (const p of pending) {
+                const div = document.createElement('div');
+                div.className = 'queue-item pending' + (p.status === 'error' ? ' error' : '');
+                const icon = document.createElement('span');
+                icon.className = 'handle';
+                icon.textContent = p.status === 'error' ? '!' : '⇣';
+                const text = document.createElement('div');
+                text.className = 'text';
+                const title = document.createElement('div');
+                title.className = 'title';
+                title.textContent = p.title;
+                const sub = document.createElement('div');
+                sub.className = 'file';
+                sub.textContent = p.status === 'error' ? `Failed: ${p.error}`
+                    : p.status === 'queued' ? 'Downloaded, added to queue'
+                    : `Fetching from YouTube · ${Math.round(p.percent)}%` + (p.eta ? ` · ${p.eta} left` : '') + (p.user ? ` · queued by ${p.user}` : '');
+                text.append(title, sub);
+                div.append(icon, posterEl(p.thumbnail, '', 'thumb'), text);
+                if (p.status === 'error') {
+                    const btn = document.createElement('button');
+                    btn.className = 'danger';
+                    btn.textContent = '✕';
+                    btn.title = 'Dismiss';
+                    btn.onclick = async () => {
+                        try { await api('/api/youtube/jobs/' + p.id, {method: 'DELETE'}); container.dataset.key = ''; refreshStatus(); }
+                        catch (e) { toast(e.message, true); }
+                    };
+                    div.appendChild(btn);
+                }
+                container.appendChild(div);
+            }
+        }
+
+        function renderQueueItems(container, visible, state) {
             for (const item of visible) {
                 const isCurrent = item.current && state !== 'stopped';
                 const div = document.createElement('div');
@@ -569,6 +737,41 @@
             },
         });
 
+        // --- Images: drop anywhere on the page, or pick a file (phones) ---
+        const dropzone = document.getElementById('dropzone');
+        const imageInput = document.getElementById('image-file');
+        document.getElementById('image-pick').onclick = () => imageInput.click();
+        imageInput.addEventListener('change', () => { if (imageInput.files[0]) uploadImage(imageInput.files[0]); imageInput.value = ''; });
+        let dragDepth = 0;
+        window.addEventListener('dragenter', (e) => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) { dragDepth++; dropzone.classList.add('over'); } });
+        window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; dropzone.classList.remove('over'); } });
+        window.addEventListener('dragover', (e) => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) e.preventDefault(); });
+        window.addEventListener('drop', (e) => {
+            if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+            e.preventDefault();
+            dragDepth = 0; dropzone.classList.remove('over');
+            uploadImage(e.dataTransfer.files[0]);
+        });
+
+        async function uploadImage(file) {
+            if (!file.type.startsWith('image/')) { toast('That is not an image file.', true); return; }
+            const form = new FormData();
+            form.append('file', file);
+            form.append('user', nameBox.value.trim());
+            form.append('duration', document.getElementById('image-duration').value);
+            dropzone.classList.add('busy');
+            toast(`Uploading ${file.name}...`);
+            try {
+                const data = await api('/api/queue/image', {method: 'POST', body: form});
+                toast(data.message);
+                refreshStatus();
+            } catch (e) {
+                toast(e.message, true);
+            } finally {
+                dropzone.classList.remove('busy');
+            }
+        }
+
         document.querySelectorAll('.controls button').forEach(btn => {
             btn.onclick = async () => {
                 try {
@@ -578,7 +781,20 @@
             };
         });
 
-        document.getElementById('search').addEventListener('input', renderGrid);
+        const YT_LINK_RE = /^(https?:\/\/)?(www\.|m\.|music\.)?(youtube\.com\/|youtu\.be\/)/i;
+        document.getElementById('search').addEventListener('input', (e) => {
+            // A pasted YouTube link works from any library: jump to YouTube and look it up.
+            if (activeLibrary !== YT && ytEnabled && YT_LINK_RE.test(e.target.value.trim())) {
+                const chip = [...document.querySelectorAll('#chips .chip')].find(c => c.classList.contains('yt'));
+                if (chip) { chip.click(); return; }  // the chip's handler runs the search
+            }
+            if (activeLibrary !== YT) { renderGrid(); return; }
+            clearTimeout(ytTimer);
+            ytTimer = setTimeout(searchYouTube, YT_LINK_RE.test(e.target.value.trim()) ? 0 : 700);  // links go straight away, typing is debounced
+        });
+        document.getElementById('search').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && activeLibrary === YT) { clearTimeout(ytTimer); searchYouTube(); }
+        });
 
         fetchMedia();
         refreshStatus();

@@ -96,6 +96,37 @@ folder with one extra file, `requests/tracks.json`. `start.ps1` points VLC at th
 `--lua-config "http={dir='...'}"`. If VLC was started some other way the dropdowns stay hidden
 and the watcher does nothing.
 
+## YouTube
+
+Pick the **YouTube** chip and the search box searches YouTube (or takes a pasted link). Tap a
+result, press Queue, and it plays on the projector like anything else: 1080p where available,
+with the queue showing the video's title and thumbnail. This covers music too.
+
+How it works: VLC 3 can't open YouTube links itself any more, and feeding it YouTube's separate
+video and audio streams gives picture with no sound. So `youtube.py` runs
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) to **download** the video (H.264 up to 1080p plus
+AAC, merged by ffmpeg into one `.mkv` in `cache/youtube/`) and queues that file. A short clip
+takes a few seconds; the download shows in Up next with a percentage and joins the queue when
+done. Downloads are cached in `cache/youtube/` (reused if queued again) and trimmed beyond
+`YT_CACHE_GB` (20 GB, oldest first) or older than `YT_CACHE_DAYS` (7 days). Files still in
+VLC's playlist are never trimmed.
+
+yt-dlp needs a JavaScript runtime for YouTube's checks and ffmpeg for merging; `start.ps1`
+downloads a portable Deno into `tools\deno` the first time and updates yt-dlp on every start,
+because YouTube changes often and yt-dlp breaks until updated. ffmpeg must be on PATH (it is
+on this PC).
+
+Needs internet on the projector PC, and thumbnails are loaded from YouTube by guests' phones.
+Age-restricted videos won't download (no login). At most three downloads run at once.
+
+## Pictures on the projector
+
+Drop an image anywhere on the page (or tap "choose one" on a phone), pick how long it should
+show (10s to 5 minutes, or until skipped), and it joins the queue like a video. VLC shows
+stills natively, so memes, scoreboards and "pizza is here" notes just work. JPG, PNG, GIF,
+WebP and BMP up to `IMAGE_MAX_MB` (25). Uploads sit in `cache/images/` and are deleted after
+`IMAGE_KEEP_DAYS` (2) unless still queued.
+
 ## Syncing the library
 
 The NAS is scanned at startup and again whenever a library is older than `SCAN_TTL`. To pick up
@@ -138,6 +169,11 @@ Settings are read from `.env` (see `.env.example`) or environment variables, wit
 | `VLC_PORT`        | `8080`                           |                                                      |
 | `VLC_PASSWORD`    | `Password123`                    | VLC's Lua HTTP password                              |
 | `SCAN_TTL`        | `600`                            | Seconds between NAS re-scans                         |
+| `YT_FORMAT`       | H.264 ≤1080p + AAC, else best    | yt-dlp format selector for YouTube downloads         |
+| `YT_CACHE_GB`     | `20`                             | Trim oldest YouTube downloads beyond this size       |
+| `YT_CACHE_DAYS`   | `7`                              | Delete YouTube downloads older than this             |
+| `DENO_PATH`       | `tools\deno\deno.exe`            | JavaScript runtime for yt-dlp                        |
+| `FFMPEG_PATH`     | ffmpeg on PATH                   | Used by yt-dlp to merge video + audio                |
 
 ## API
 
@@ -147,6 +183,9 @@ Settings are read from `.env` (see `.env.example`) or environment variables, wit
 | GET    | `/api/poster/{library}/{group}` | Cached poster JPEG, 404 if none                                |
 | POST   | `/api/queue` `{id, user?}`      | Enqueue a file; starts playback if VLC is idle                 |
 | POST   | `/api/queue/batch` `{ids, user?}` | Enqueue several in order (max 200), e.g. a season           |
+| POST   | `/api/queue/image` (multipart: `file`, `user?`, `duration?`) | Upload an image and queue it for `duration` seconds (-1 = until skipped) |
+| GET    | `/api/youtube/search?q=`        | YouTube search results, or the video behind a pasted link      |
+| POST   | `/api/queue/youtube` `{url, user?, title?}` | Download a YouTube video in the background and queue it when done; progress appears in `/api/status` `pending` |
 | GET    | `/api/tracks`                   | Audio + subtitle tracks of the playing file (501 without `vlc_http`) |
 | POST   | `/api/tracks` `{kind, id}`      | Select a track and remember it for the show; `kind` is `audio` or `subtitle`, `-1` disables |
 | DELETE | `/api/tracks/pref`              | Forget the remembered tracks for the playing show              |

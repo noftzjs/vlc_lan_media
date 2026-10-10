@@ -19,10 +19,12 @@ from urllib.parse import quote, unquote, urlparse
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+import youtube
 
 log = logging.getLogger("uvicorn.error")
 
@@ -514,6 +516,140 @@ class TrackPrefs:
 track_prefs = TrackPrefs()
 
 
+# --- EXTRA ITEMS IN THE QUEUE (YouTube downloads, uploaded images) ---
+# These live under cache/; VLC only sees the path, so we keep title/thumbnail/options here.
+extra_items: dict[str, dict] = {}  # lowercased local path -> {title, name, poster, queued_by, options, youtube?}
+yt_jobs: dict[str, dict] = {}  # job id -> {url, title, user, percent, eta, status, error, started}
+yt_lock = threading.Lock()
+IMAGE_DIR = BASE_DIR / "cache" / "images"
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+IMAGE_MAX_MB = int(os.environ.get("IMAGE_MAX_MB", "25"))
+IMAGE_KEEP_DAYS = float(os.environ.get("IMAGE_KEEP_DAYS", "2"))
+
+
+def _path_key(path_or_uri: str) -> str:
+    if path_or_uri.startswith("file:"):
+        u = urlparse(path_or_uri)
+        p = unquote(u.path)
+        path_or_uri = f"//{u.netloc}{p}" if u.netloc else p.lstrip("/")
+    return path_or_uri.replace("\\", "/").lower().strip("/")
+
+
+_yt_key = _path_key  # kept for readability where YouTube paths are meant
+
+
+def extra_lookup(uri: str) -> dict | None:
+    with yt_lock:
+        return extra_items.get(_path_key(uri))
+
+
+def queued_paths() -> set[str]:
+    try:
+        return {_path_key(x["uri"]) for x in vlc_playlist() if x["uri"].startswith("file:")}
+    except HTTPException:
+        return set()  # VLC not up; nothing is queued then
+
+
+def yt_trim_cache() -> None:
+    """Trim old downloads, but never one that's still in VLC's playlist."""
+    youtube.trim_cache(queued_paths())
+
+
+def image_trim_cache() -> None:
+    """Uploaded images are throwaway: drop them after IMAGE_KEEP_DAYS unless still queued."""
+    keep = queued_paths()
+    now = time.time()
+    for f in IMAGE_DIR.iterdir():
+        if f.is_file() and _path_key(str(f)) not in keep and now - f.stat().st_mtime > IMAGE_KEEP_DAYS * 86400:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
+def enqueue_uri(uri: str) -> None:
+    """in_enqueue that re-applies per-item VLC options (e.g. an image's display time)."""
+    item = extra_lookup(uri)
+    params = {"command": "in_enqueue", "input": uri}
+    if item and item.get("options"):
+        params["option"] = item["options"]
+    vlc("status.json", **params)
+
+
+def play_last_if_idle(was_idle: bool) -> bool:
+    if was_idle:
+        items = vlc_playlist()
+        if items:
+            vlc("status.json", command="pl_play", id=items[-1]["id"])
+            return True
+    return False
+
+
+def yt_fetch_and_queue(job_id: str) -> None:
+    """Background: download the video, then queue the file (and play it if VLC is idle)."""
+    job = yt_jobs[job_id]
+
+    def progress(p: dict) -> None:
+        job.update({k: v for k, v in p.items() if k in ("percent", "eta")})
+        if p.get("meta"):
+            job["title"] = p["meta"]["title"] or job["title"]
+            job["thumbnail"] = p["meta"].get("thumbnail")
+
+    try:
+        meta = youtube.download(job["url"], progress)
+        path = Path(meta["path"])
+        with yt_lock:
+            extra_items[_yt_key(str(path))] = {
+                "title": meta["title"], "name": meta.get("uploader") or "YouTube", "poster": meta.get("thumbnail"),
+                "queued_by": job["user"] or None, "duration": meta.get("duration") or 0,
+                "youtube": meta["url"], "options": [],
+            }
+        was_idle = vlc("status.json").get("state") == "stopped"
+        enqueue_uri(path.as_uri())
+        play_last_if_idle(was_idle)
+        job.update({"status": "queued", "percent": 100.0, "title": meta["title"]})
+        log.info("Queued by %s: YouTube %s (%s)", job["user"] or "anonymous", meta["title"], meta["url"])
+        yt_trim_cache()
+        try:
+            with QUEUE_LOG.open("a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{job['user'] or '-'}\tyoutube:{meta['url']}\t{meta['title']}\n")
+        except OSError:
+            pass
+    except HTTPException as e:
+        job.update({"status": "error", "error": e.detail})
+    except Exception as e:  # keep the job table sane whatever happens
+        job.update({"status": "error", "error": str(e)[:200]})
+    if job["status"] == "error":
+        log.warning("YouTube fetch failed for %s: %s", job["url"], job["error"])
+        try:
+            with QUEUE_LOG.open("a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{job['user'] or '-'}\tFAILED youtube:{job['url']}\t{job['error']}\n")
+        except OSError:
+            pass
+    job["finished"] = time.time()
+
+
+# Finished jobs leave the pending list quickly (the real queue item has appeared); failures stay
+# long enough to be read, or until dismissed.
+YT_JOB_LINGER = {"queued": 3, "error": 90}
+
+
+def yt_pending() -> list[dict]:
+    """Jobs still fetching, plus recently finished/failed ones so the page can show the outcome."""
+    now = time.time()
+    with yt_lock:
+        for jid in [j for j, job in yt_jobs.items()
+                    if job.get("finished") and now - job["finished"] > YT_JOB_LINGER.get(job["status"], 0)]:
+            del yt_jobs[jid]
+        return [
+            {"id": jid, "title": job["title"], "user": job["user"], "percent": job.get("percent", 0.0),
+             "eta": job.get("eta", ""), "status": job["status"], "error": job.get("error"),
+             "thumbnail": job.get("thumbnail")}
+            for jid, job in yt_jobs.items()
+        ]
+
+
 # --- VLC HTTP INTERFACE ---
 def vlc(endpoint: str, **params) -> dict:
     """Call VLC's HTTP interface (requests/status.json or requests/playlist.json) and return the JSON."""
@@ -549,15 +685,30 @@ def vlc_playlist() -> list[dict]:
         # VLC swaps the item name for the file's embedded title tag once it pre-parses it, which can
         # be empty or garbled. The real filename from the URI is what people recognise.
         fname = filename_from_uri(uri)
-        items.append({
-            "id": int(c["id"]),
-            "name": fname or c.get("name", ""),
-            "uri": uri,
-            "duration": c.get("duration", -1),
-            "current": c.get("current") == "current",
-            **library.describe(uri),
-        })
+        extra = extra_lookup(uri)
+        if extra:
+            info = {
+                "name": extra["name"], "title": extra["title"], "poster": extra.get("poster"),
+                "queued_by": extra.get("queued_by"), "youtube": extra.get("youtube"), "image": extra.get("image"),
+                "duration": extra.get("duration") if extra.get("duration") else c.get("duration", -1),
+            }
+        else:
+            info = {"name": fname or c.get("name", ""), "duration": c.get("duration", -1), **library.describe(uri)}
+        items.append({"id": int(c["id"]), "uri": uri, "current": c.get("current") == "current", **info})
     return items
+
+
+def rebuild_upcoming(upcoming: list[dict], order: list[dict]) -> None:
+    """Replace the upcoming part of VLC's playlist with `order` (VLC's HTTP API has no move)."""
+    for x in upcoming:
+        vlc("status.json", command="pl_delete", id=x["id"])
+    for x in order:
+        enqueue_uri(x["uri"])
+
+
+def upcoming_items(state: str, items: list[dict]) -> list[dict]:
+    current = next((i for i, x in enumerate(items) if x["current"]), None)
+    return items if state == "stopped" or current is None else items[current + 1:]
 
 
 def current_show_key() -> tuple[str | None, dict | None]:
@@ -586,9 +737,6 @@ def track_watcher() -> None:
                 continue
             key, g = current_show_key()
             prefs = track_prefs.get(key) if key else {}
-            if not prefs:
-                handled_plid, attempts = plid, 0
-                continue
             tracks = vlc("tracks.json")
             if not any(t["id"] != -1 for t in tracks.get("audio", []) + tracks.get("subtitle", [])):
                 attempts += 1  # demux not ready yet; give it a few seconds
@@ -603,6 +751,15 @@ def track_watcher() -> None:
                 if want is not None and want != have:
                     vlc("tracks.json", command={"audio": "audio_track", "subtitle": "subtitle_track"}[kind], val=want)
                     log.info("Track watcher: %s -> %s for %s", kind, want, g["title"])
+            # Never start an item silent: if no audio track ended up selected (seen with YouTube
+            # downloads), switch on the first real one.
+            if not prefs.get("audio"):
+                audio = tracks.get("audio", [])
+                have = next((t["id"] for t in audio if t["current"]), -1)
+                first = next((t["id"] for t in audio if t["id"] != -1), None)
+                if have == -1 and first is not None:
+                    vlc("tracks.json", command="audio_track", val=first)
+                    log.info("Track watcher: audio was disabled, enabled track %s", first)
             handled_plid, attempts = plid, 0
         except HTTPException:
             pass  # VLC down or started without vlc_http; try again next tick
@@ -615,6 +772,12 @@ def track_watcher() -> None:
 async def lifespan(_: FastAPI):
     if not TMDB_API_KEY:
         log.warning("TMDB_API_KEY not set: posters disabled. See .env.example")
+    if not youtube.available():
+        log.warning("yt-dlp not found: YouTube disabled (pip install yt-dlp[default])")
+    elif not youtube.DENO:
+        log.warning("Deno not found: YouTube downloads will fail. start.ps1 fetches it into tools/deno")
+    yt_trim_cache()
+    image_trim_cache()
     library.scan_in_background()
     threading.Thread(target=track_watcher, name="track-watcher", daemon=True).start()
     yield
@@ -622,6 +785,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="LAN Party Projector Queue", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")  # uploaded images, for queue thumbnails
 
 
 class QueueRequest(BaseModel):
@@ -673,7 +837,88 @@ def list_media(refresh: str = Query("", description="'all' to rescan every libra
         "scanning_libraries": sorted(library.scanning_labels),
         "posters_enabled": bool(TMDB_API_KEY),
         "posters_warming": posters.warming,
+        "youtube_enabled": youtube.available(),
     }
+
+
+@app.get("/api/youtube/search")
+def youtube_search(q: str = Query("", max_length=200)):
+    """Search YouTube, or describe a pasted link. Thumbnails are hotlinked from YouTube."""
+    return {"results": youtube.search(q)}
+
+
+class YouTubeQueueRequest(BaseModel):
+    url: str
+    user: str = ""
+    title: str = ""  # optional, shown while the download runs
+
+
+@app.post("/api/queue/youtube")
+def queue_youtube(req: YouTubeQueueRequest):
+    """Fetch a YouTube video in the background and queue it when done. Returns straight away."""
+    if not youtube.is_url(req.url):
+        raise HTTPException(status_code=400, detail="That doesn't look like a YouTube link.")
+    if not youtube.available():
+        raise HTTPException(status_code=501, detail="yt-dlp is not installed (pip install yt-dlp[default]).")
+    user = re.sub(r"\s+", " ", req.user).strip()[:40]
+    with yt_lock:
+        if sum(1 for j in yt_jobs.values() if j["status"] == "fetching") >= 3:
+            raise HTTPException(status_code=429, detail="Three videos are already downloading, try again in a moment.")
+        job_id = hashlib.sha1(f"{req.url}{time.time()}".encode()).hexdigest()[:10]
+        yt_jobs[job_id] = {"url": req.url.strip(), "title": req.title.strip() or req.url.strip(), "user": user,
+                           "percent": 0.0, "eta": "", "status": "fetching", "started": time.time()}
+    threading.Thread(target=yt_fetch_and_queue, args=(job_id,), name=f"yt-{job_id}", daemon=True).start()
+    return {"message": f"Fetching: {yt_jobs[job_id]['title']}", "job": job_id}
+
+
+@app.post("/api/queue/image")
+async def queue_image(file: UploadFile = File(...), user: str = Form(""), duration: int = Form(15)):
+    """Upload a picture (meme, scoreboard, info) and show it on the projector for `duration` seconds (-1 = until skipped)."""
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in IMAGE_EXTS or not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only JPG, PNG, GIF, WebP or BMP images.")
+    if duration != -1:
+        duration = max(3, min(duration, 3600))
+    data = bytearray()
+    while chunk := await file.read(1 << 20):
+        data += chunk
+        if len(data) > IMAGE_MAX_MB << 20:
+            raise HTTPException(status_code=413, detail=f"Image is bigger than {IMAGE_MAX_MB} MB.")
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    name = re.sub(r"\s+", " ", user).strip()[:40]
+    # One file per upload: the same picture queued twice with different titles/durations must not collide.
+    stored = IMAGE_DIR / f"{int(time.time() * 1000):x}_{hashlib.sha1(data).hexdigest()[:8]}{ext}"
+    stored.write_bytes(data)
+    title = Path(file.filename).stem[:80] or "Image"
+    shown = "until skipped" if duration == -1 else f"{duration}s"
+    with yt_lock:
+        extra_items[_path_key(str(stored))] = {
+            "title": title, "name": f"Image · {shown}", "poster": f"/images/{stored.name}", "queued_by": name or None,
+            "duration": 0 if duration == -1 else duration, "image": True, "options": [f"image-duration={duration}"],
+        }
+    was_idle = vlc("status.json").get("state") == "stopped"
+    enqueue_uri(stored.as_uri())
+    log.info("Queued by %s: image %s (%s)", name or "anonymous", title, shown)
+    try:
+        with QUEUE_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{name or '-'}\timage:{stored.name}\t{title}\n")
+    except OSError:
+        pass
+    image_trim_cache()
+    if play_last_if_idle(was_idle):
+        return {"message": f"Now showing: {title}"}
+    return {"message": f"Queued: {title} ({shown})"}
+
+
+@app.delete("/api/youtube/jobs/{job_id}")
+def dismiss_youtube_job(job_id: str):
+    """Dismiss a finished or failed download notice (a running download can't be cancelled)."""
+    with yt_lock:
+        job = yt_jobs.get(job_id)
+        if job and job["status"] != "fetching":
+            del yt_jobs[job_id]
+    return {"message": "ok"}
 
 
 @app.get("/api/poster/{library_label}/{group}")
@@ -732,17 +977,12 @@ def queue_batch(req: BatchQueueRequest):
 def reorder_queue(req: ReorderRequest):
     """Reorder the upcoming items. VLC's HTTP API has no 'move', so we delete them and re-add in the new order."""
     state = vlc("status.json").get("state")
-    items = vlc_playlist()
-    current = next((i for i, x in enumerate(items) if x["current"]), None)
-    upcoming = items if state == "stopped" or current is None else items[current + 1:]
+    upcoming = upcoming_items(state, vlc_playlist())
     by_id = {x["id"]: x for x in upcoming}
     if sorted(req.ids) != sorted(by_id):
         raise HTTPException(status_code=409, detail="The queue changed, refresh and try again.")
     if [x["id"] for x in upcoming] != req.ids:
-        for x in upcoming:
-            vlc("status.json", command="pl_delete", id=x["id"])
-        for item_id in req.ids:
-            vlc("status.json", command="in_enqueue", input=by_id[item_id]["uri"])
+        rebuild_upcoming(upcoming, [by_id[i] for i in req.ids])
     return {"message": "Queue reordered", "queue": vlc_playlist()}
 
 
@@ -753,9 +993,13 @@ def status():
     meta = s.get("information", {}).get("category", {}).get("meta", {})
     queue = vlc_playlist()
     current = next((x for x in queue if x["current"]), None)
+    if current and (current.get("youtube") or current.get("image")):
+        now_playing = current["name"]  # uploader / "Image · 15s"; VLC's own meta is just the cache filename
+    else:
+        now_playing = meta.get("title") or meta.get("filename") or (current or {}).get("name")
     return {
         "state": s.get("state"),
-        "now_playing": meta.get("title") or meta.get("filename") or (current or {}).get("name"),
+        "now_playing": now_playing,
         "title": current["title"] if current else None,
         "poster": current["poster"] if current else None,
         "time": s.get("time", 0),
@@ -763,6 +1007,7 @@ def status():
         "volume": s.get("volume", 0),
         "fullscreen": bool(s.get("fullscreen")),
         "queue": queue,
+        "pending": yt_pending(),
     }
 
 
