@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 .env
 cache/
-tools/
+tools/*
+!tools/queue_report.py

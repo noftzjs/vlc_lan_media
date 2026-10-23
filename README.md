@@ -52,6 +52,26 @@ There is no login. Anyone who can reach the page controls the projector, which i
 room of friends and nothing else. Never port-forward this or expose it to the internet, and
 leave VLC's own web interface bound to localhost (the start script does this).
 
+## Blocks, credit and playlists
+
+- **Queue season / Queue all** put the episodes in the queue as one block: a header that drags the
+  whole thing, the episodes reorderable inside it, one ✕ to drop it all. A YouTube playlist is a
+  block too.
+- **Paste a playlist link** in the YouTube search and a "Queue playlist" card appears. Its videos
+  are downloaded one at a time (so a playlist never hogs the three download slots) and each one
+  joins the block as it lands; the first `YT_PLAYLIST_MAX` (default 25) are taken, in playlist order.
+  Cancelling the running download from Up next stops the rest.
+- **Every request is logged privately** to `cache/queue_events.jsonl`: time, what was queued
+  (title, category: movie / tv / anime / youtube / image, season and episode, playlist or block),
+  who asked (the name typed, else the name that LAN address used before: `cache/requesters.json`),
+  the address, and whether it came from a phone or a PC. A watcher also records how each item
+  ended: watched to the end, or skipped at what point and by whom (the last next / stop / remove
+  within a few seconds gets the credit), plus removals from the queue. Nothing from it is shown
+  on the page.
+  After the party, `python tools/queue_report.py` prints the review (by person, category, device,
+  day and hour, most-queued shows, failures); `--markdown` gives a Discord-ready block and
+  `--json out.json` the raw tables. Delete the file before the party for a clean weekend.
+
 ## Ideas / future features
 
 - `/qr` page that renders a QR code for the current LAN address, plus a copy-link line in the UI.

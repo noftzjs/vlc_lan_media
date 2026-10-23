@@ -53,6 +53,40 @@ def is_url(text: str) -> bool:
     return bool(_URL_RE.search(text.strip()))
 
 
+_LIST_RE = re.compile(r"[?&]list=([A-Za-z0-9_-]+)")
+PLAYLIST_MAX = int(os.environ.get("YT_PLAYLIST_MAX", "25"))  # videos taken from a playlist, in order
+
+
+def is_playlist(text: str) -> bool:
+    """Any link carrying a playlist id: /playlist?list=..., a watch link with list=, or a Mix
+    (list=RD..., YouTube's auto-generated radio). A watch link still lists its own video first."""
+    t = text.strip()
+    return is_url(t) and bool(_LIST_RE.search(t))
+
+
+def playlist(url: str, limit: int = PLAYLIST_MAX) -> dict:
+    """The first `limit` videos of a playlist in playlist order, with its title and full count.
+    A Mix has no fixed length (YouTube keeps generating it), so its count is what we took."""
+    import json
+
+    url = url.strip()
+    m = _LIST_RE.search(url)
+    if not m:
+        raise HTTPException(status_code=400, detail="That link has no playlist id.")
+    list_id = m.group(1)
+    # A Mix is only viewable through the watch link that seeded it, and a watch+list link works
+    # for ordinary playlists too; only a bare id needs the playlist page.
+    target = url if "v=" in url else f"https://www.youtube.com/playlist?list={list_id}"
+    # --yes-playlist overrides the --no-playlist that _base_cmd sets for single videos.
+    out = _run(["--yes-playlist", "--flat-playlist", "--playlist-end", str(limit), "-J", target], timeout=90)
+    data = json.loads(out or "{}")
+    entries = [_summary(e) for e in (data.get("entries") or []) if e and e.get("id")]
+    is_mix = list_id.startswith("RD")
+    return {"title": data.get("title") or ("YouTube Mix" if is_mix else "YouTube playlist"), "url": target,
+            "count": len(entries) if is_mix else int(data.get("playlist_count") or len(entries)),
+            "mix": is_mix, "entries": entries}
+
+
 def _base_cmd() -> list[str]:
     cmd = [YTDLP, "--no-playlist", "--no-warnings"]
     if DENO:

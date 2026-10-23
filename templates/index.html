@@ -63,6 +63,19 @@
         .queue-item.sortable-ghost { opacity: .3; }
         .queue-item.sortable-chosen { background: #2a2a2a; }
         .queue-item.sortable-fallback { opacity: .9; box-shadow: 0 4px 16px #000a; border-radius: 8px; }
+        /* A season or playlist queued in one go: one block that drags as a unit, items reorder inside it. */
+        .queue-group { border-bottom: 1px solid #2d2d2d; background: #181818; }
+        .queue-group:last-child { border-bottom: none; }
+        .queue-group .group-head { display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: #262626; }
+        .queue-group .group-head .text { flex: 1; min-width: 0; }
+        .queue-group .group-head .title { font-weight: bold; }
+        .queue-group .group-head .file { color: #888; font-size: .78rem; }
+        .queue-group .group-head .chevron { cursor: pointer; color: #888; padding: 4px 6px; user-select: none; }
+        .queue-group .group-items .queue-item { padding-left: 26px; }
+        .queue-group.collapsed .group-items { display: none; }
+        .queue-group.sortable-ghost { opacity: .3; }
+        .queue-group.sortable-chosen { background: #2a2a2a; }
+        .queue-group.sortable-fallback { opacity: .9; box-shadow: 0 4px 16px #000a; border-radius: 8px; }
         body.sortable-dragging { user-select: none; cursor: grabbing; }
 
         /* image drop zone */
@@ -168,7 +181,6 @@
     </div>
     <div class="grid" id="grid"><div class="muted">Loading NAS library...</div></div>
     <div class="muted" id="grid-note"></div>
-
     <div id="sheet-backdrop"></div>
     <div id="sheet"></div>
     <div id="toast"></div>
@@ -179,6 +191,7 @@
         let activeLibrary = '';       // '' = all, a library name, or YT for YouTube search
         const YT = '__youtube__';
         let ytResults = [];
+        let ytPlaylist = null;  // set when the search box holds a playlist link
         let ytTimer = null;
         let ytEnabled = false;
         let dragging = false;
@@ -296,6 +309,7 @@
                 const data = await api('/api/youtube/search?q=' + encodeURIComponent(q));
                 if (activeLibrary !== YT || document.getElementById('search').value.trim() !== q) return;  // stale
                 ytResults = data.results;
+                ytPlaylist = data.playlist || null;
                 renderYouTube();
             } catch (e) {
                 grid.innerHTML = `<div class="muted">${e.message}</div>`;
@@ -306,7 +320,44 @@
             const grid = document.getElementById('grid');
             grid.className = 'grid wide';
             grid.innerHTML = '';
-            if (!ytResults.length) { grid.innerHTML = '<div class="muted">No results.</div>'; return; }
+            if (ytPlaylist) {
+                // The pasted link is a playlist: offer the whole thing (downloaded one at a time, queued as a block).
+                const card = document.createElement('div');
+                card.className = 'card wide';
+                const meta = document.createElement('div');
+                meta.className = 'meta';
+                const title = document.createElement('div');
+                title.className = 'title';
+                title.textContent = ytPlaylist.mix ? ytPlaylist.title : `Playlist: ${ytPlaylist.title}`;
+                const sub = document.createElement('div');
+                sub.className = 'sub';
+                sub.textContent = (ytPlaylist.mix
+                        ? `A YouTube Mix (endless) · the first ${ytPlaylist.count} get queued`
+                        : `${ytPlaylist.count} video${ytPlaylist.count === 1 ? '' : 's'}` + (ytPlaylist.count > ytPlaylist.limit ? ` · the first ${ytPlaylist.limit} get queued` : ''))
+                    + ' · fetched one at a time, kept together in the queue';
+                const btn = document.createElement('button');
+                btn.className = 'primary';
+                btn.textContent = ytPlaylist.mix ? '＋ Queue the Mix' : '＋ Queue playlist';
+                btn.onclick = async (e) => {
+                    e.stopPropagation();
+                    btn.disabled = true;
+                    try {
+                        const data = await api('/api/queue/youtube', {method: 'POST', body: JSON.stringify({url: ytPlaylist.url, user: nameBox.value.trim(), title: ytPlaylist.title})});
+                        toast(data.message);
+                        document.getElementById('search').value = '';
+                        ytResults = []; ytPlaylist = null;
+                        renderGrid();
+                        refreshStatus();
+                    } catch (err) {
+                        toast(err.message, true);
+                        btn.disabled = false;
+                    }
+                };
+                meta.append(title, sub, btn);
+                card.appendChild(meta);
+                grid.appendChild(card);
+            }
+            if (!ytResults.length && !ytPlaylist) { grid.innerHTML = '<div class="muted">No results.</div>'; return; }
             for (const v of ytResults) {
                 const card = document.createElement('div');
                 card.className = 'card wide';
@@ -459,7 +510,8 @@
                 const btn = document.createElement('button');
                 btn.textContent = label === 'All' ? '＋ Queue all' : '＋ Queue season';
                 btn.disabled = episodes.length === 0;
-                btn.onclick = (e) => { e.stopPropagation(); queueFiles(episodes, btn); };
+                const blockLabel = label === 'All' || label.toLowerCase().includes(g.title.toLowerCase()) ? (label === 'All' ? g.title : label) : `${g.title} · ${label}`;
+                btn.onclick = (e) => { e.stopPropagation(); queueFiles(episodes, btn, blockLabel); };
                 row.append(name, btn);
                 sheet.appendChild(row);
                 const body = document.createElement('div');
@@ -510,13 +562,13 @@
             return queueFiles([item], btn);
         }
 
-        async function queueFiles(items, btn) {
+        async function queueFiles(items, btn, label = '') {
             btn.disabled = true;
             try {
                 const user = nameBox.value.trim();
                 const data = items.length === 1
                     ? await api('/api/queue', {method: 'POST', body: JSON.stringify({id: items[0].id, user})})
-                    : await api('/api/queue/batch', {method: 'POST', body: JSON.stringify({ids: items.map(i => i.id), user})});
+                    : await api('/api/queue/batch', {method: 'POST', body: JSON.stringify({ids: items.map(i => i.id), user, label})});
                 toast(data.message);
                 closeSheet();
                 refreshStatus();
@@ -638,7 +690,7 @@
             // Hide already-played items: show the current one and everything after it.
             const cur = queue.findIndex(q => q.current);
             const visible = (state === 'stopped' || cur < 0) ? queue : queue.slice(cur);
-            const key = JSON.stringify([visible.map(q => [q.id, q.current && state !== 'stopped', q.queued_by]),
+            const key = JSON.stringify([visible.map(q => [q.id, q.current && state !== 'stopped', q.queued_by, q.group]),
                                         pending.map(p => [p.id, Math.round(p.percent), p.status])]);
             if (container.dataset.key === key) return;  // nothing changed, don't disturb the DOM
             container.dataset.key = key;
@@ -683,20 +735,119 @@
             }
         }
 
+        // Consecutive items of one group (a season, a playlist) render as a block: a header that
+        // drags the whole thing, the items reorderable inside. The server only ever sees the flat order.
+        const collapsedGroups = new Set();
+
         function renderQueueItems(container, visible, state) {
+            let block = null;
             for (const item of visible) {
                 const isCurrent = item.current && state !== 'stopped';
+                const el = queueItemEl(item, isCurrent, container, Boolean(item.group) && !isCurrent);
+                if (!item.group || isCurrent) { block = null; container.appendChild(el); continue; }
+                if (!block || block.dataset.group !== item.group) {
+                    block = groupEl(item, container);
+                    container.appendChild(block);
+                }
+                block.querySelector('.group-items').appendChild(el);
+                block._items.push(item);
+                updateGroupHead(block);
+            }
+        }
+
+        function groupEl(item, container) {
+            const block = document.createElement('div');
+            block.className = 'queue-group' + (collapsedGroups.has(item.group) ? ' collapsed' : '');
+            block.dataset.group = item.group;
+            block._items = [];
+            const head = document.createElement('div');
+            head.className = 'group-head';
+            const handle = document.createElement('span');
+            handle.className = 'handle';
+            handle.textContent = '⠿';
+            handle.title = 'Drag the whole block';
+            const chevron = document.createElement('span');
+            chevron.className = 'chevron';
+            chevron.textContent = collapsedGroups.has(item.group) ? '▸' : '▾';
+            chevron.onclick = () => {
+                const now = block.classList.toggle('collapsed');
+                if (now) collapsedGroups.add(item.group); else collapsedGroups.delete(item.group);
+                chevron.textContent = now ? '▸' : '▾';
+            };
+            const text = document.createElement('div');
+            text.className = 'text';
+            const title = document.createElement('div');
+            title.className = 'title';
+            title.textContent = item.group_label || 'Queued together';
+            const file = document.createElement('div');
+            file.className = 'file';
+            text.append(title, file);
+            const btn = document.createElement('button');
+            btn.className = 'danger';
+            btn.textContent = '✕';
+            btn.title = 'Remove the whole block from the queue';
+            btn.onclick = async () => {
+                try { const d = await api('/api/queue/group/' + item.group, {method: 'DELETE'}); toast(d.message); container.dataset.key = ''; refreshStatus(); }
+                catch (e) { toast(e.message, true); }
+            };
+            head.append(handle, chevron, text, btn);
+            const items = document.createElement('div');
+            items.className = 'group-items';
+            block.append(head, items);
+            // Items move only within their block (their own Sortable group name keeps them out of the main list).
+            Sortable.create(items, {
+                group: 'block-' + item.group,
+                handle: '.in-handle',
+                animation: 150, delay: 150, delayOnTouchOnly: true,
+                forceFallback: true, fallbackTolerance: 3, forceAutoScrollFallback: true,
+                scroll: true, scrollSensitivity: 80, scrollSpeed: 12, bubbleScroll: true,
+                onStart: () => { dragging = true; document.body.classList.add('sortable-dragging'); },
+                onEnd: () => { dragging = false; document.body.classList.remove('sortable-dragging'); sendOrder(); },
+            });
+            return block;
+        }
+
+        function updateGroupHead(block) {
+            const items = block._items;
+            const total = items.reduce((t, q) => t + Math.max(0, q.duration || 0), 0);
+            const who = (items.find(q => q.queued_by) || {}).queued_by;
+            block.querySelector('.group-head .file').textContent =
+                [`${items.length} item${items.length === 1 ? '' : 's'}`, total ? fmtDuration(total) : '', who ? `queued by ${who}` : ''].filter(Boolean).join(' · ');
+        }
+
+        // The flat order the server wants: blocks contribute their items in place.
+        function queueOrder() {
+            const ids = [];
+            for (const el of document.getElementById('queue').children) {
+                if (el.classList.contains('queue-group')) el.querySelectorAll('.queue-item').forEach(d => ids.push(Number(d.dataset.id)));
+                else if (el.classList.contains('queue-item') && !el.classList.contains('current') && !el.classList.contains('pending')) ids.push(Number(el.dataset.id));
+            }
+            return ids;
+        }
+
+        async function sendOrder() {
+            try {
+                await api('/api/queue/reorder', {method: 'POST', body: JSON.stringify({ids: queueOrder()})});
+            } catch (e) {
+                toast(e.message, true);
+            }
+            document.getElementById('queue').dataset.key = '';
+            refreshStatus();
+        }
+
+        function queueItemEl(item, isCurrent, container, inBlock = false) {
+            {
                 const div = document.createElement('div');
                 div.className = 'queue-item' + (isCurrent ? ' current' : '');
                 div.dataset.id = item.id;
                 const handle = document.createElement('span');
-                handle.className = 'handle';
+                handle.className = inBlock ? 'handle in-handle' : 'handle';
                 handle.textContent = isCurrent ? '▶' : '⠿';
                 const text = document.createElement('div');
                 text.className = 'text';
                 const title = document.createElement('div');
                 title.className = 'title';
-                title.textContent = (item.title || item.name) + (item.duration > 0 ? ` · ${fmtTime(item.duration)}` : '');
+                title.textContent = (item.title || item.name) + (item.episode ? ` · ${item.episode}` : '') + (item.duration > 0 ? ` · ${fmtTime(item.duration)}` : '');
                 const file = document.createElement('div');
                 file.className = 'file';
                 file.textContent = [item.title ? item.name : '', item.queued_by ? `queued by ${item.queued_by}` : ''].filter(Boolean).join(' · ');
@@ -710,13 +861,14 @@
                     catch (e) { toast(e.message, true); }
                 };
                 div.append(handle, posterEl(item.poster, '', 'thumb'), text, btn);
-                container.appendChild(div);
+                return div;
             }
         }
 
         Sortable.create(document.getElementById('queue'), {
-            handle: '.handle',
-            filter: '.current',   // the playing item stays put
+            draggable: '.queue-item, .queue-group',
+            handle: '.handle:not(.in-handle)',   // a block's own handle, or a loose item's; items inside blocks have their own list
+            filter: '.current, .pending',   // the playing item stays put; downloads aren't in VLC yet
             preventOnFilter: false,
             animation: 150,
             delay: 150, delayOnTouchOnly: true,   // let phones scroll without grabbing items
@@ -728,19 +880,13 @@
             scroll: true, scrollSensitivity: 80, scrollSpeed: 12, bubbleScroll: true,
             onMove: evt => !evt.related.classList.contains('current'),  // nothing goes above the playing item
             onStart: () => { dragging = true; document.body.classList.add('sortable-dragging'); },
-            onEnd: async () => {
+            onEnd: () => {
                 dragging = false;
                 document.body.classList.remove('sortable-dragging');
-                const ids = [...document.querySelectorAll('#queue .queue-item:not(.current)')].map(d => Number(d.dataset.id));
-                try {
-                    await api('/api/queue/reorder', {method: 'POST', body: JSON.stringify({ids})});
-                } catch (e) {
-                    toast(e.message, true);
-                }
-                document.getElementById('queue').dataset.key = '';
-                refreshStatus();
+                sendOrder();
             },
         });
+
 
         // --- Images: drop anywhere on the page, or pick a file (phones) ---
         const dropzone = document.getElementById('dropzone');

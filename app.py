@@ -22,7 +22,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -63,7 +63,8 @@ POSTER_DIR = BASE_DIR / "cache" / "posters"
 POSTER_META_FILE = BASE_DIR / "cache" / "posters.json"
 POSTER_RETRY_AFTER = 7 * 24 * 3600  # re-check titles with no poster found after a week
 
-QUEUE_LOG = BASE_DIR / "cache" / "queue.log"  # who queued what, one line per request
+# Who queued what: one JSON object per line, private, reviewed after the party (tools/queue_report.py).
+EVENT_LOG = BASE_DIR / "cache" / "queue_events.jsonl"
 TRACK_PREFS_FILE = BASE_DIR / "cache" / "track_prefs.json"  # remembered audio/sub choice per show
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".wmv", ".ts", ".mpg", ".mpeg"}
@@ -317,12 +318,29 @@ class Library:
         return (label, rel.lower())
 
     def describe(self, uri: str) -> dict:
-        """Poster, title and who queued it, for a URI from VLC's playlist. Nones if it isn't ours."""
+        """Poster, title, episode marker and who queued it, for a URI from VLC's playlist. Nones if it isn't ours."""
         key = self.key_for_uri(uri)
         if not key:
-            return {"title": None, "poster": None, "queued_by": None}
+            return {"title": None, "poster": None, "queued_by": None, "episode": None}
         g = self.by_relpath[key]
-        return {"title": g["title"], "poster": g["poster"], "queued_by": self.queued_by.get(key)}
+        return {"title": g["title"], "poster": g["poster"], "queued_by": self.queued_by.get(key),
+                "episode": self.episode_label(g, key)}
+
+    @staticmethod
+    def episode_label(g: dict, key: tuple[str, str]) -> str | None:
+        """What tells one queued episode from the next: 'S02E05' when the folder names a season,
+        'E05' otherwise, the file's own name for extras and unnumbered files. None for a one-file
+        movie, whose title already says everything."""
+        if len(g["items"]) < 2:
+            return None
+        wanted = f"{key[0]}/{key[1]}".lower()
+        it = next((x for x in g["items"] if x["id"].lower() == wanted), None)
+        if it is None:
+            return None
+        if it.get("episode") is not None and not it.get("extra"):
+            m = _SEASON_DIR_RE.match((it.get("season") or "").strip())
+            return (f"S{int(m.group(1)):02d}" if m else "") + f"E{it['episode']:02d}"
+        return Path(it["file"]).stem
 
 
 # --- POSTERS (TMDB, cached on disk) ---
@@ -524,6 +542,128 @@ track_prefs = TrackPrefs()
 extra_items: dict[str, dict] = {}  # lowercased local path -> {title, name, poster, queued_by, options, youtube?}
 yt_jobs: dict[str, dict] = {}  # job id -> {url, title, user, percent, eta, status, error, started}
 yt_lock = threading.Lock()
+
+
+# --- QUEUE GROUPS (a season or a playlist queued in one go) AND WHO ASKED FOR WHAT ---
+# VLC's item ids change every time the queue is rebuilt, so a group remembers its members by
+# path; the page shows a contiguous run of one group as a single block that drags as a unit.
+QUEUE_GROUPS_FILE = BASE_DIR / "cache" / "queue_groups.json"
+queue_groups: dict[str, dict] = {}  # gid -> {label, kind, user, created, keys: [path key, ...]}
+# Nobody logs in; the LAN address is the identity. A name typed once is remembered for it.
+REQUESTERS_FILE = BASE_DIR / "cache" / "requesters.json"
+requesters: dict[str, dict] = {}  # ip -> {name, seen}
+groups_lock = threading.Lock()
+
+
+def _load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text("utf-8")) if path.exists() else {}
+    except ValueError:
+        return {}
+
+
+def _save_json(path: Path, data: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=0), "utf-8")
+    except OSError as e:
+        log.warning("Could not save %s: %s", path.name, e)
+
+
+queue_groups.update(_load_json(QUEUE_GROUPS_FILE))
+requesters.update(_load_json(REQUESTERS_FILE))
+
+
+def new_group(label: str, kind: str, user: str | None) -> str:
+    gid = hashlib.sha1(f"{label}{time.time()}".encode()).hexdigest()[:8]
+    with groups_lock:
+        queue_groups[gid] = {"label": label[:120], "kind": kind, "user": user, "created": time.time(), "keys": []}
+        _save_json(QUEUE_GROUPS_FILE, queue_groups)
+    return gid
+
+
+def group_add(gid: str, uri: str) -> None:
+    with groups_lock:
+        g = queue_groups.get(gid)
+        if g is None:
+            return
+        key = _path_key(uri)
+        if key not in g["keys"]:
+            g["keys"].append(key)
+        _save_json(QUEUE_GROUPS_FILE, queue_groups)
+
+
+def group_for_uri(uri: str) -> tuple[str | None, dict | None]:
+    key = _path_key(uri)
+    with groups_lock:
+        for gid, g in reversed(list(queue_groups.items())):  # the newest group wins if a file is in two
+            if key in g["keys"]:
+                return gid, g
+    return None, None
+
+
+def prune_groups(items: list[dict]) -> None:
+    """Forget groups with no member left in VLC's playlist."""
+    present = {_path_key(x["uri"]) for x in items}
+    with groups_lock:
+        stale = [gid for gid, g in queue_groups.items() if not any(k in present for k in g["keys"])]
+        for gid in stale:
+            del queue_groups[gid]
+        if stale:
+            _save_json(QUEUE_GROUPS_FILE, queue_groups)
+
+
+def client_ip(request: Request | None) -> str | None:
+    return request.client.host if request is not None and request.client else None
+
+
+def requester_name(ip: str | None, typed: str) -> str:
+    """The name to credit: what was typed (remembered for this address from now on), else what
+    this address called itself before, else nothing."""
+    name = re.sub(r"\s+", " ", typed).strip()[:40]
+    if not ip:
+        return name
+    with groups_lock:
+        if name:
+            requesters[ip] = {"name": name, "seen": time.time()}
+            _save_json(REQUESTERS_FILE, requesters)
+        else:
+            name = (requesters.get(ip) or {}).get("name", "")
+    return name
+
+
+_PHONE_RE = re.compile(r"Mobile|Android|iPhone|iPad", re.IGNORECASE)
+
+
+def device_kind(request: Request | None) -> str | None:
+    """"phone" or "pc" from the user agent, for the after-party question of what people used."""
+    if request is None:
+        return None
+    return "phone" if _PHONE_RE.search(request.headers.get("user-agent", "")) else "pc"
+
+
+def queue_event(kind: str, *, name: str, ip: str | None, device: str | None = None, **fields) -> None:
+    """Append one request to cache/queue_events.jsonl. `name` is the credited name (typed now or
+    remembered for the address), empty when unknown; `fields` carry what was queued."""
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "kind": kind, "name": name or None, "ip": ip,
+           "device": device, **{k: v for k, v in fields.items() if v is not None}}
+    try:
+        EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with EVENT_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.warning("Could not write the queue event log: %s", e)
+
+
+def library_category(label: str) -> str:
+    """movie / tv / anime / <library name>: the Anime folder is a TV library by env but worth its own bucket."""
+    if "anime" in label.lower():
+        return "anime"
+    if label in MOVIE_LIBRARIES:
+        return "movie"
+    if label in TV_LIBRARIES:
+        return "tv"
+    return label.lower()
 EXTRA_ITEMS_FILE = BASE_DIR / "cache" / "extra_items.json"  # survives server restarts
 
 
@@ -654,7 +794,7 @@ def yt_fetch_and_queue(job_id: str) -> None:
     def progress(p: dict) -> None:
         job.update({k: v for k, v in p.items() if k in ("percent", "eta")})
         if p.get("meta"):
-            job["title"] = p["meta"]["title"] or job["title"]
+            job["title"] = job.get("prefix", "") + (p["meta"]["title"] or job["title"])
             job["thumbnail"] = p["meta"].get("thumbnail")
 
     try:
@@ -667,15 +807,18 @@ def yt_fetch_and_queue(job_id: str) -> None:
         })
         was_idle = vlc("status.json").get("state") == "stopped"
         enqueue_uri(path.as_uri())
+        if job.get("group"):
+            group_add(job["group"], path.as_uri())
         play_last_if_idle(was_idle)
-        job.update({"status": "queued", "percent": 100.0, "title": meta["title"]})
+        if job.get("group"):
+            keep_group_together(job["group"])
+        job.update({"status": "queued", "percent": 100.0, "title": job.get("prefix", "") + meta["title"]})
         log.info("Queued by %s: YouTube %s (%s)", job["user"] or "anonymous", meta["title"], meta["url"])
         yt_trim_cache()
-        try:
-            with QUEUE_LOG.open("a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{job['user'] or '-'}\tyoutube:{meta['url']}\t{meta['title']}\n")
-        except OSError:
-            pass
+        queue_event("youtube", name=job["user"], ip=job.get("ip"), device=job.get("device"), category="youtube",
+                    title=meta["title"], url=meta["url"], uploader=meta.get("uploader") or None,
+                    duration=meta.get("duration") or None, playlist=job.get("playlist"),
+                    playlist_index=job.get("index"), playlist_count=job.get("count"), started_playback=was_idle or None)
     except HTTPException as e:
         job.update({"status": "cancelled" if job.get("cancelled") else "error", "error": e.detail})
     except Exception as e:  # keep the job table sane whatever happens
@@ -685,12 +828,28 @@ def yt_fetch_and_queue(job_id: str) -> None:
         log.info("YouTube fetch cancelled: %s", job["title"])
     if job["status"] == "error":
         log.warning("YouTube fetch failed for %s: %s", job["url"], job["error"])
-        try:
-            with QUEUE_LOG.open("a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{job['user'] or '-'}\tFAILED youtube:{job['url']}\t{job['error']}\n")
-        except OSError:
-            pass
+        queue_event("youtube", name=job["user"], ip=job.get("ip"), device=job.get("device"), category="youtube",
+                    title=job["title"], url=job["url"], playlist=job.get("playlist"), failed=True, error=job["error"])
     job["finished"] = time.time()
+
+
+def yt_playlist_worker(gid: str, pl: dict, user: str, ip: str | None, device: str | None = None) -> None:
+    """Download a playlist's videos one after another; each joins the queue (and the block) as it
+    lands, so one playlist never holds more than one of the download slots. Cancelling the
+    running download from the page stops the rest."""
+    n = len(pl["entries"])
+    for i, entry in enumerate(pl["entries"], 1):
+        prefix = f"{pl['title']} ({i}/{n}) · "
+        job_id = hashlib.sha1(f"{entry['url']}{time.time()}".encode()).hexdigest()[:10]
+        with yt_lock:
+            yt_jobs[job_id] = {"url": entry["url"], "title": prefix + (entry["title"] or entry["url"]), "prefix": prefix,
+                               "user": user, "ip": ip, "device": device, "percent": 0.0, "eta": "", "status": "fetching",
+                               "started": time.time(), "group": gid, "thumbnail": entry.get("thumbnail"),
+                               "playlist": pl["title"], "index": i, "count": n}
+        yt_fetch_and_queue(job_id)
+        if yt_jobs.get(job_id, {}).get("status") == "cancelled":
+            log.info("Playlist stopped after %d of %d: %s", i, n, pl["title"])
+            break
 
 
 # Finished jobs leave the pending list quickly (the real queue item has appeared); failures stay
@@ -757,7 +916,9 @@ def vlc_playlist() -> list[dict]:
             }
         else:
             info = {"name": fname or c.get("name", ""), "duration": c.get("duration", -1), **library.describe(uri)}
-        items.append({"id": int(c["id"]), "uri": uri, "current": c.get("current") == "current", **info})
+        gid, grp = group_for_uri(uri)
+        items.append({"id": int(c["id"]), "uri": uri, "current": c.get("current") == "current",
+                      "group": gid, "group_label": grp["label"] if grp else None, **info})
     return items
 
 
@@ -767,6 +928,20 @@ def rebuild_upcoming(upcoming: list[dict], order: list[dict]) -> None:
         vlc("status.json", command="pl_delete", id=x["id"])
     for x in order:
         enqueue_uri(x["uri"])
+
+
+def keep_group_together(gid: str) -> None:
+    """A playlist video that just finished downloading was added at the end of VLC's playlist.
+    If something else was queued while it downloaded, move it up to follow the rest of its block."""
+    state = vlc("status.json").get("state")
+    upcoming = upcoming_items(state, vlc_playlist())
+    if len(upcoming) < 2 or upcoming[-1].get("group") != gid:
+        return
+    last_member = max((i for i, x in enumerate(upcoming[:-1]) if x.get("group") == gid), default=None)
+    if last_member is None or last_member == len(upcoming) - 2:
+        return  # no earlier member to follow, or already right behind it
+    order = upcoming[:last_member + 1] + [upcoming[-1]] + upcoming[last_member + 1:-1]
+    rebuild_upcoming(upcoming, order)
 
 
 def upcoming_items(state: str, items: list[dict]) -> list[dict]:
@@ -785,6 +960,74 @@ def current_show_key() -> tuple[str | None, dict | None]:
         return None, None
     g = library.by_relpath[key]
     return f"{g['library']}/{g['group']}", g
+
+
+# The last next/previous/stop/remove and who sent it, so a skip logged a moment later can say
+# who did it. Not a queue of actions: one slot, overwritten.
+last_control: dict = {}
+
+
+def note_control(action: str, request: Request | None) -> None:
+    ip = client_ip(request)
+    last_control.update({"action": action, "name": requester_name(ip, ""), "ip": ip, "device": device_kind(request),
+                         "ts": time.time()})
+
+
+def describe_playing(item: dict | None, status: dict) -> dict:
+    """The fields worth keeping about an item for a playback event."""
+    if not item:
+        meta = status.get("information", {}).get("category", {}).get("meta", {})
+        return {"title": meta.get("title") or meta.get("filename"), "category": "other"}
+    if item.get("youtube"):
+        category = "youtube"
+    elif item.get("image"):
+        category = "image"
+    else:
+        key = library.key_for_uri(item["uri"])
+        category = library_category(key[0]) if key else "other"
+    return {"category": category, "title": item.get("title") or item.get("name"), "episode": item.get("episode"),
+            "file": item.get("name") if item.get("title") else None, "queued_by": item.get("queued_by")}
+
+
+def playback_outcome(watched: float, length: float) -> tuple[str, dict] | None:
+    """'finished' when it ran (almost) to the end, 'skipped' otherwise; None when VLC never
+    reported a length (stills, streams), because then there is nothing to judge."""
+    if not length or length <= 0:
+        return None
+    finished = (length - watched) <= 15 or watched / length >= 0.9
+    return ("finished" if finished else "skipped",
+            {"watched_s": int(watched), "length_s": int(length), "progress": round(min(watched, length) / length, 2)})
+
+
+def playback_watcher() -> None:
+    """Notice when the playing item changes and record whether the last one was watched to the end
+    or skipped, how far in, and (if a control came in just before) by whom."""
+    cur: dict | None = None  # {plid, info, time, length}
+    while True:
+        time.sleep(1)
+        try:
+            s = vlc("status.json")
+            plid = s.get("currentplid", -1)
+            playing = s.get("state") != "stopped" and plid not in (-1, None)
+            if cur and (not playing or plid != cur["plid"]):
+                outcome = playback_outcome(cur["time"], cur["length"])
+                if outcome:
+                    event, numbers = outcome
+                    extra = {}
+                    if event == "skipped" and last_control and time.time() - last_control["ts"] <= 5:
+                        extra = {"via": last_control["action"], "by": last_control.get("name") or last_control.get("ip")}
+                    queue_event("playback", name="", ip=None, event=event, **cur["info"], **numbers, **extra)
+                cur = None
+            if playing and cur is None:
+                item = next((x for x in vlc_playlist() if x["id"] == plid), None)
+                cur = {"plid": plid, "info": describe_playing(item, s), "time": 0.0, "length": float(s.get("length") or 0)}
+            if cur and playing:
+                cur["time"] = float(s.get("time") or cur["time"])
+                cur["length"] = float(s.get("length") or cur["length"])
+        except HTTPException:
+            pass  # VLC down; try again next tick
+        except Exception as e:  # never let the watcher die
+            log.warning("Playback watcher error: %s", e)
 
 
 def track_watcher() -> None:
@@ -843,6 +1086,7 @@ async def lifespan(_: FastAPI):
     image_trim_cache()
     library.scan_in_background()
     threading.Thread(target=track_watcher, name="track-watcher", daemon=True).start()
+    threading.Thread(target=playback_watcher, name="playback-watcher", daemon=True).start()
     yield
 
 
@@ -859,6 +1103,7 @@ class QueueRequest(BaseModel):
 class BatchQueueRequest(BaseModel):
     ids: list[str]
     user: str = ""
+    label: str = ""  # e.g. "Breaking Bad · Season 2": the items become one block in the queue
 
 
 class ControlRequest(BaseModel):
@@ -906,8 +1151,13 @@ def list_media(refresh: str = Query("", description="'all' to rescan every libra
 
 @app.get("/api/youtube/search")
 def youtube_search(q: str = Query("", max_length=200)):
-    """Search YouTube, or describe a pasted link. Thumbnails are hotlinked from YouTube."""
-    return {"results": youtube.search(q)}
+    """Search results, or the videos of a pasted link; a playlist link also describes the playlist."""
+    if youtube.is_playlist(q):
+        pl = youtube.playlist(q)
+        return {"results": pl["entries"],
+                "playlist": {"title": pl["title"], "url": pl["url"], "count": pl["count"], "limit": youtube.PLAYLIST_MAX,
+                             "mix": pl["mix"]}}
+    return {"results": youtube.search(q), "playlist": None}
 
 
 class YouTubeQueueRequest(BaseModel):
@@ -917,25 +1167,39 @@ class YouTubeQueueRequest(BaseModel):
 
 
 @app.post("/api/queue/youtube")
-def queue_youtube(req: YouTubeQueueRequest):
-    """Fetch a YouTube video in the background and queue it when done. Returns straight away."""
+def queue_youtube(req: YouTubeQueueRequest, request: Request):
+    """Fetch a YouTube video (or, one at a time, a playlist) in the background and queue it when done."""
     if not youtube.is_url(req.url):
         raise HTTPException(status_code=400, detail="That doesn't look like a YouTube link.")
     if not youtube.available():
         raise HTTPException(status_code=501, detail="yt-dlp is not installed (pip install yt-dlp[default]).")
-    user = re.sub(r"\s+", " ", req.user).strip()[:40]
+    ip = client_ip(request)
+    user = requester_name(ip, req.user)
     with yt_lock:
         if sum(1 for j in yt_jobs.values() if j["status"] == "fetching") >= 3:
             raise HTTPException(status_code=429, detail="Three videos are already downloading, try again in a moment.")
+    if youtube.is_playlist(req.url):
+        pl = youtube.playlist(req.url)
+        if not pl["entries"]:
+            raise HTTPException(status_code=404, detail="That playlist is empty or private.")
+        gid = new_group(pl["title"], "playlist", user or None)
+        threading.Thread(target=yt_playlist_worker, args=(gid, pl, user, ip, device_kind(request)),
+                         name=f"yt-pl-{gid}", daemon=True).start()
+        n = len(pl["entries"])
+        more = f" of {pl['count']}" if pl["count"] > n else ""
+        what = "Mix" if pl["mix"] else "playlist"
+        return {"message": f"Fetching {what}: {pl['title']} ({n} video{'' if n == 1 else 's'}{more}, one at a time)"}
+    with yt_lock:
         job_id = hashlib.sha1(f"{req.url}{time.time()}".encode()).hexdigest()[:10]
         yt_jobs[job_id] = {"url": req.url.strip(), "title": req.title.strip() or req.url.strip(), "user": user,
-                           "percent": 0.0, "eta": "", "status": "fetching", "started": time.time()}
+                           "ip": ip, "device": device_kind(request), "percent": 0.0, "eta": "", "status": "fetching",
+                           "started": time.time()}
     threading.Thread(target=yt_fetch_and_queue, args=(job_id,), name=f"yt-{job_id}", daemon=True).start()
     return {"message": f"Fetching: {yt_jobs[job_id]['title']}", "job": job_id}
 
 
 @app.post("/api/queue/image")
-async def queue_image(file: UploadFile = File(...), user: str = Form(""), duration: int = Form(15)):
+async def queue_image(request: Request, file: UploadFile = File(...), user: str = Form(""), duration: int = Form(15)):
     """Upload a picture (meme, scoreboard, info) and show it on the projector for `duration` seconds (-1 = until skipped)."""
     ext = Path(file.filename or "").suffix.lower()
     if ext not in IMAGE_EXTS or not (file.content_type or "").startswith("image/"):
@@ -949,7 +1213,7 @@ async def queue_image(file: UploadFile = File(...), user: str = Form(""), durati
             raise HTTPException(status_code=413, detail=f"Image is bigger than {IMAGE_MAX_MB} MB.")
     if not data:
         raise HTTPException(status_code=400, detail="Empty file.")
-    name = re.sub(r"\s+", " ", user).strip()[:40]
+    name = requester_name(client_ip(request), user)
     # One file per upload: the same picture queued twice with different titles/durations must not collide.
     stem = f"{int(time.time() * 1000):x}_{hashlib.sha1(data).hexdigest()[:8]}"
     raw = IMAGE_DIR / f"{stem}.upload{ext}"
@@ -976,11 +1240,9 @@ async def queue_image(file: UploadFile = File(...), user: str = Form(""), durati
     was_idle = vlc("status.json").get("state") == "stopped"
     enqueue_uri(stored.as_uri())
     log.info("Queued by %s: image %s (%s)", name or "anonymous", title, shown)
-    try:
-        with QUEUE_LOG.open("a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{name or '-'}\timage:{stored.name}\t{title}\n")
-    except OSError:
-        pass
+    queue_event("image", name=name, ip=client_ip(request), device=device_kind(request), category="image",
+                title=title, file=stored.name, duration=None if duration == -1 else duration,
+                until_skipped=duration == -1 or None, started_playback=was_idle or None)
     image_trim_cache()
     if play_last_if_idle(was_idle):
         return {"message": f"Now showing: {title}"}
@@ -1014,25 +1276,33 @@ def poster(library_label: str, group: str):
     return FileResponse(file, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
 
 
-def enqueue(ids: list[str], user: str) -> dict:
-    """Add files to the end of VLC's playlist. Starts playback from the first one if VLC is idle."""
+def enqueue(ids: list[str], user: str, *, ip: str | None = None, label: str = "",
+            device: str | None = None) -> dict:
+    """Add files to the end of VLC's playlist. Starts playback from the first one if VLC is idle.
+    Several files with a `label` (a season, "all of" a show) become one block in the queue."""
     paths = [library.resolve(i) for i in ids]  # validate everything before touching VLC
-    user = re.sub(r"\s+", " ", user).strip()[:40]
+    user = requester_name(ip, user)
+    gid = new_group(label, "season", user or None) if label.strip() and len(ids) > 1 else None
     was_idle = vlc("status.json").get("state") == "stopped"
     first_new_id = None
     for item_id, path in zip(ids, paths):
         # Path.as_uri() percent-encodes spaces etc. so VLC gets a valid file:// MRL.
         vlc("status.json", command="in_enqueue", input=path.as_uri())
+        if gid:
+            group_add(gid, path.as_uri())
         if first_new_id is None and was_idle:
             items = vlc_playlist()
             first_new_id = items[-1]["id"] if items else None
-        library.queued_by[library.key_for_id(item_id)] = user or None
+        key = library.key_for_id(item_id)
+        library.queued_by[key] = user or None
         log.info("Queued by %s: %s", user or "anonymous", item_id)
-        try:
-            with QUEUE_LOG.open("a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{user or '-'}\t{item_id}\n")
-        except OSError:
-            pass
+        g = library.by_relpath.get(key) or {}
+        it = next((x for x in g.get("items", []) if x["id"] == item_id), {})
+        queue_event("library", name=user, ip=ip, device=device, category=library_category(key[0]),
+                    library=key[0], title=g.get("title") or path.stem, year=g.get("year"), file=path.name,
+                    season=it.get("season"), episode=it.get("episode"), extra=it.get("extra") or None,
+                    block=label.strip() or None, batch=len(ids) if len(ids) > 1 else None,
+                    started_playback=(was_idle and item_id == ids[0]) or None)
     what = paths[0].name if len(paths) == 1 else f"{len(paths)} episodes"
     if was_idle and first_new_id is not None:
         vlc("status.json", command="pl_play", id=first_new_id)
@@ -1041,18 +1311,34 @@ def enqueue(ids: list[str], user: str) -> dict:
 
 
 @app.post("/api/queue")
-def queue_media(req: QueueRequest):
-    return enqueue([req.id], req.user)
+def queue_media(req: QueueRequest, request: Request):
+    return enqueue([req.id], req.user, ip=client_ip(request), device=device_kind(request))
 
 
 @app.post("/api/queue/batch")
-def queue_batch(req: BatchQueueRequest):
-    """Queue several files in order, e.g. a whole season."""
+def queue_batch(req: BatchQueueRequest, request: Request):
+    """Queue several files in order, e.g. a whole season, as one block."""
     if not req.ids:
         raise HTTPException(status_code=400, detail="Nothing to queue.")
     if len(req.ids) > 200:
         raise HTTPException(status_code=400, detail="That's too many at once (max 200).")
-    return enqueue(req.ids, req.user)
+    return enqueue(req.ids, req.user, ip=client_ip(request), label=req.label, device=device_kind(request))
+
+
+@app.delete("/api/queue/group/{gid}")
+def remove_group(gid: str):
+    """Drop every upcoming item of a season or playlist block in one go."""
+    with groups_lock:
+        g = queue_groups.get(gid)
+    if not g:
+        raise HTTPException(status_code=404, detail="That block is gone already.")
+    state = vlc("status.json").get("state")
+    removed = 0
+    for x in upcoming_items(state, vlc_playlist()):
+        if x.get("group") == gid:
+            vlc("status.json", command="pl_delete", id=x["id"])
+            removed += 1
+    return {"message": f"Removed {removed} item{'' if removed == 1 else 's'}: {g['label']}"}
 
 
 @app.post("/api/queue/reorder")
@@ -1074,15 +1360,19 @@ def status():
     s = vlc("status.json")
     meta = s.get("information", {}).get("category", {}).get("meta", {})
     queue = vlc_playlist()
+    prune_groups(queue)
     current = next((x for x in queue if x["current"]), None)
     if current and (current.get("youtube") or current.get("image")):
         now_playing = current["name"]  # uploader / "Image · 15s"; VLC's own meta is just the cache filename
     else:
         now_playing = meta.get("title") or meta.get("filename") or (current or {}).get("name")
+    title = current["title"] if current else None
+    if title and current.get("episode"):
+        title = f"{title} · {current['episode']}"
     return {
         "state": s.get("state"),
         "now_playing": now_playing,
-        "title": current["title"] if current else None,
+        "title": title,
         "poster": current["poster"] if current else None,
         "time": s.get("time", 0),
         "length": s.get("length", 0),
@@ -1104,16 +1394,27 @@ CONTROL_COMMANDS = {
 
 
 @app.post("/api/control")
-def control(req: ControlRequest):
+def control(req: ControlRequest, request: Request):
     cmd = CONTROL_COMMANDS.get(req.action)
     if not cmd:
         raise HTTPException(status_code=400, detail=f"Unknown action '{req.action}'.")
+    if req.action in ("next", "previous", "stop"):
+        note_control(req.action, request)  # the playback watcher credits a skip to this
+        queue_event("control", name=last_control["name"], ip=last_control["ip"], device=last_control["device"],
+                    action=req.action)
     vlc("status.json", command=cmd)
     return {"message": "ok"}
 
 
 @app.delete("/api/queue/{item_id}")
-def remove_from_queue(item_id: int):
+def remove_from_queue(item_id: int, request: Request):
+    s = vlc("status.json")
+    item = next((x for x in vlc_playlist() if x["id"] == item_id), None)
+    if item and s.get("currentplid") == item_id and s.get("state") != "stopped":
+        note_control("remove", request)  # removing the playing item is a skip
+    ip = client_ip(request)
+    queue_event("remove", name=requester_name(ip, ""), ip=ip, device=device_kind(request),
+                **(describe_playing(item, s) if item else {}), was_playing=bool(item and s.get("currentplid") == item_id) or None)
     vlc("status.json", command="pl_delete", id=item_id)
     return {"message": "Removed from queue"}
 
