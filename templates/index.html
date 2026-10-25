@@ -196,6 +196,7 @@
         const YT = '__youtube__';
         let ytResults = [];
         let ytPlaylist = null;  // set when the search box holds a playlist link
+        const ytQueued = new Set();  // video urls queued from the current playlist results, to tag them
         let ytTimer = null;
         let ytEnabled = false;
         let dragging = false;
@@ -315,6 +316,7 @@
                 if (activeLibrary !== YT || document.getElementById('search').value.trim() !== q) return;  // stale
                 ytResults = data.results;
                 ytPlaylist = data.playlist || null;
+                ytQueued.clear();
                 renderYouTube();
             } catch (e) {
                 grid.innerHTML = `<div class="muted">${e.message}</div>`;
@@ -374,7 +376,8 @@
                 title.textContent = v.title;
                 const sub = document.createElement('div');
                 sub.className = 'sub';
-                sub.textContent = [v.uploader, v.live ? 'LIVE' : (v.duration ? fmtTime(v.duration) : '')].filter(Boolean).join(' · ');
+                sub.textContent = [v.uploader, v.live ? 'LIVE' : (v.duration ? fmtTime(v.duration) : ''), ytQueued.has(v.url) ? '✓ queued' : ''].filter(Boolean).join(' · ');
+                if (ytQueued.has(v.url)) card.style.opacity = '.6';
                 meta.append(title, sub);
                 card.appendChild(meta);
                 card.onclick = () => openYouTubeSheet(v);
@@ -413,10 +416,16 @@
                     const data = await api('/api/queue/youtube', {method: 'POST', body: JSON.stringify({url: v.url, user: nameBox.value.trim(), title: v.title})});
                     toast(data.message + ' — it joins the queue when the download finishes');
                     closeSheet();
-                    // Start fresh for the next person: clear the search and the results.
-                    document.getElementById('search').value = '';
-                    ytResults = [];
-                    renderGrid();
+                    if (ytPlaylist) {
+                        // A playlist stays on screen so a few more can be picked; the one just queued gets a tag.
+                        ytQueued.add(v.url);
+                        renderYouTube();
+                    } else {
+                        // Start fresh for the next person: clear the search and the results.
+                        document.getElementById('search').value = '';
+                        ytResults = [];
+                        renderGrid();
+                    }
                     refreshStatus();
                 } catch (e) {
                     toast(e.message, true);

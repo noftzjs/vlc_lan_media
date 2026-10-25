@@ -4,7 +4,7 @@
 - [x] Queue a YouTube playlist, not just single videos: stage the downloads one at a time and cap how many videos are pulled from a playlist *(idea 2026-10-23)*
 - [x] Group bulk-queued items (a playlist, a TV season) in a container on the queue so the whole group can be dragged around while keeping its order *(idea 2026-10-23)*
 - [x] Log everything queued over the LAN weekend by the requester's IP (no login), tie the IP to the optional name when one is given, so we can see who did the most to keep the queue going *(idea 2026-10-23)* *(2026-10-23: private JSONL log with title, category, season/episode, device, address; tools/queue_report.py for the after-party review; nothing shown on the page by choice)*
-- [ ] YouTube: after queueing one video from a pasted playlist, keep the playlist's results on screen so a few more can be picked; the search box is cleared after every queue now, so either stop clearing it for playlist/link searches or detect generic vs specific searches *(idea 2026-10-24)*
+- [x] YouTube: after queueing one video from a pasted playlist, keep the playlist's results on screen so a few more can be picked; the search box is cleared after every queue now, so either stop clearing it for playlist/link searches or detect generic vs specific searches *(idea 2026-10-24)* *(done 2026-10-25: playlist results stay, queued ones tagged ✓; word searches still clear)*
 
 
 ## MVP (done)
