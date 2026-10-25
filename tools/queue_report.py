@@ -76,6 +76,7 @@ def summarize(rows: list[dict], top: int) -> dict:
     blocks = Counter(r["block"] for r in ok if r.get("block"))
     playlists = Counter(r["playlist"] for r in ok if r.get("playlist"))
     started = sum(1 for r in ok if r.get("started_playback"))
+    rolled = sum(1 for r in ok if r.get("random"))
     skipped = [r for r in playback if r.get("event") == "skipped"]
     finished = sum(1 for r in playback if r.get("event") == "finished")
     skipped_by = Counter(r.get("by") or "unknown" for r in skipped)
@@ -86,7 +87,7 @@ def summarize(rows: list[dict], top: int) -> dict:
     last_ts = max((r["ts"] for r in rows), default=None)
     return {
         "span": {"first": first_ts, "last": last_ts, "requests": len(ok), "failed": len(failed), "started_playback": started,
-                 "finished": finished, "skipped": len(skipped)},
+                 "finished": finished, "skipped": len(skipped), "rolled": rolled},
         "skipped": [{"ts": r["ts"], "what": what(r), "queued_by": r.get("queued_by"), "watched_s": r.get("watched_s"),
                      "length_s": r.get("length_s"), "by": r.get("by"), "via": r.get("via")} for r in skipped],
         "skipped_titles": skipped_titles.most_common(top),
@@ -117,7 +118,8 @@ def print_text(s: dict) -> None:
     sp = s["span"]
     print(f"Queue log: {sp['requests']} requests ({sp['failed']} failed), {sp['first']} -> {sp['last']}; "
           f"{sp['started_playback']} started playback straight away (VLC was idle)")
-    print(f"Playback: {sp['finished']} watched to the end, {sp['skipped']} skipped")
+    print(f"Playback: {sp['finished']} watched to the end, {sp['skipped']} skipped"
+          + (f"; {sp['rolled']} came from the secret menu" if sp.get("rolled") else ""))
     print("\nBy person")
     for p, n in s["by_person"]:
         cats = ", ".join(f"{c} {k}" for k, c in sorted(s["by_person_category"][p].items(), key=lambda kv: -kv[1]))

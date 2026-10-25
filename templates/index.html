@@ -4,13 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LAN Projector Queue</title>
+    <link rel="icon" href="/static/vlc16x16.png">
     <style>
         * { box-sizing: border-box; }
         [hidden] { display: none !important; }  /* explicit display rules below must not override hidden */
         body { font-family: system-ui, sans-serif; background: #121212; color: #e0e0e0; margin: 0 auto; padding: 0 16px 16px; max-width: 1100px; }
         .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 0; border-bottom: 1px solid #2d2d2d; margin-bottom: 8px; }
         .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 1.05rem; letter-spacing: .02em; }
-        .brand .dot { width: 10px; height: 10px; border-radius: 50%; background: #ff5722; box-shadow: 0 0 10px #ff5722aa; }
+        .brand img { width: 28px; height: 28px; filter: drop-shadow(0 0 6px #ff572266); }
         .brand span.sub { color: #777; font-weight: normal; font-size: .85rem; }
         .name-box { width: min(240px, 50vw); padding: 9px 12px; border-radius: 8px; border: 1px solid #333; background: #1e1e1e; color: #fff; font-size: .95rem; }
         .name-box:focus { outline: none; border-color: #ff5722; }
@@ -76,6 +77,9 @@
         .queue-group.sortable-ghost { opacity: .3; }
         .queue-group.sortable-chosen { background: #2a2a2a; }
         .queue-group.sortable-fallback { opacity: .9; box-shadow: 0 4px 16px #000a; border-radius: 8px; }
+        .secret { grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 24px 0; }
+        .secret img { max-width: min(340px, 90vw); border-radius: 12px; box-shadow: 0 8px 30px #000a; }
+        .secret button { font-size: 1.1rem; padding: 12px 28px; }
         body.sortable-dragging { user-select: none; cursor: grabbing; }
 
         /* image drop zone */
@@ -127,7 +131,7 @@
 </head>
 <body>
     <header class="topbar">
-        <div class="brand"><span class="dot"></span>Projector <span class="sub">LAN queue</span></div>
+        <div class="brand"><img src="/static/vlc-48.png" alt="VLC" width="28" height="28"><span class="sub">LAN queue</span></div>
         <input type="text" id="username" class="name-box" placeholder="Your name (optional)" maxlength="40" autocomplete="off">
     </header>
 
@@ -299,6 +303,7 @@
 
         // --- YouTube ---
         async function searchYouTube() {
+            if (isSecret()) { renderSecret(); return; }
             const q = document.getElementById('search').value.trim();
             const grid = document.getElementById('grid');
             document.getElementById('grid-note').textContent = '';
@@ -429,7 +434,43 @@
             fetchMedia(activeLibrary || 'all');
         };
 
+        // The secret menu. Nothing on the page mentions it; typing @claude in the search box
+        // swaps the grid for a handful of dice.
+        const SECRET = '@claude';
+        function isSecret() { return document.getElementById('search').value.trim().toLowerCase() === SECRET; }
+
+        function renderSecret() {
+            const grid = document.getElementById('grid');
+            document.getElementById('grid-note').textContent = '';
+            grid.className = 'grid wide';
+            grid.innerHTML = '';
+            const card = document.createElement('div');
+            card.className = 'secret';
+            const gif = document.createElement('img');
+            gif.src = '/static/dashing-driver-car.gif?v=' + Date.now();  // the file gets swapped; never show a cached one
+            gif.alt = 'CLAUDE TAKE THE WHEEL';
+            const btn = document.createElement('button');
+            btn.className = 'primary';
+            btn.textContent = '🎲 Random';
+            btn.onclick = async () => {
+                btn.disabled = true;
+                try {
+                    // "any": a movie, an episode, an anime, or one of tonight's YouTube downloads
+                    const data = await api('/api/queue/random', {method: 'POST', body: JSON.stringify({kind: 'any', user: nameBox.value.trim()})});
+                    toast(data.message);
+                    refreshStatus();
+                } catch (e) {
+                    toast(e.message, true);
+                } finally {
+                    btn.disabled = false;
+                }
+            };
+            card.append(gif, btn);
+            grid.appendChild(card);
+        }
+
         function renderGrid() {
+            if (isSecret()) { renderSecret(); return; }
             if (activeLibrary === YT) { renderYouTube(); return; }
             document.getElementById('grid').className = 'grid';
             const terms = document.getElementById('search').value.toLowerCase().trim().split(/\s+/).filter(Boolean);
@@ -815,19 +856,21 @@
                 [`${items.length} item${items.length === 1 ? '' : 's'}`, total ? fmtDuration(total) : '', who ? `queued by ${who}` : ''].filter(Boolean).join(' · ');
         }
 
-        // The flat order the server wants: blocks contribute their items in place.
+        // The flat order the server wants: blocks contribute their items in place. Both the VLC ids
+        // and the files go, because VLC renumbers the queue on every rebuild and the ids may be stale.
         function queueOrder() {
-            const ids = [];
+            const ids = [], uris = [];
+            const take = d => { ids.push(Number(d.dataset.id)); uris.push(d.dataset.uri); };
             for (const el of document.getElementById('queue').children) {
-                if (el.classList.contains('queue-group')) el.querySelectorAll('.queue-item').forEach(d => ids.push(Number(d.dataset.id)));
-                else if (el.classList.contains('queue-item') && !el.classList.contains('current') && !el.classList.contains('pending')) ids.push(Number(el.dataset.id));
+                if (el.classList.contains('queue-group')) el.querySelectorAll('.queue-item').forEach(take);
+                else if (el.classList.contains('queue-item') && !el.classList.contains('current') && !el.classList.contains('pending')) take(el);
             }
-            return ids;
+            return {ids, uris};
         }
 
         async function sendOrder() {
             try {
-                await api('/api/queue/reorder', {method: 'POST', body: JSON.stringify({ids: queueOrder()})});
+                await api('/api/queue/reorder', {method: 'POST', body: JSON.stringify(queueOrder())});
             } catch (e) {
                 toast(e.message, true);
             }
@@ -840,6 +883,7 @@
                 const div = document.createElement('div');
                 div.className = 'queue-item' + (isCurrent ? ' current' : '');
                 div.dataset.id = item.id;
+                div.dataset.uri = item.uri;
                 const handle = document.createElement('span');
                 handle.className = inBlock ? 'handle in-handle' : 'handle';
                 handle.textContent = isCurrent ? '▶' : '⠿';
@@ -878,7 +922,8 @@
             fallbackTolerance: 3,
             forceAutoScrollFallback: true,
             scroll: true, scrollSensitivity: 80, scrollSpeed: 12, bubbleScroll: true,
-            onMove: evt => !evt.related.classList.contains('current'),  // nothing goes above the playing item
+            // Nothing goes above the playing item: a drop on it lands right under it instead of bouncing back.
+            onMove: evt => evt.related.classList.contains('current') ? 1 : true,
             onStart: () => { dragging = true; document.body.classList.add('sortable-dragging'); },
             onEnd: () => {
                 dragging = false;

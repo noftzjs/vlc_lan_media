@@ -60,7 +60,9 @@ leave VLC's own web interface bound to localhost (the start script does this).
 - **Paste a playlist link** in the YouTube search and a "Queue playlist" card appears. Its videos
   are downloaded one at a time (so a playlist never hogs the three download slots) and each one
   joins the block as it lands; the first `YT_PLAYLIST_MAX` (default 25) are taken, in playlist order.
-  Cancelling the running download from Up next stops the rest.
+  Cancelling the running download from Up next stops the rest. Playlist videos, and any single
+  video YouTube files under Music, are fetched at 720p instead of 1080p (`YT_FORMAT_CAPPED`) so
+  the wait stays short; everything else keeps the full ladder (`YT_FORMAT`).
 - **Every request is logged privately** to `cache/queue_events.jsonl`: time, what was queued
   (title, category: movie / tv / anime / youtube / image, season and episode, playlist or block),
   who asked (the name typed, else the name that LAN address used before: `cache/requesters.json`),
@@ -71,6 +73,14 @@ leave VLC's own web interface bound to localhost (the start script does this).
   After the party, `python tools/queue_report.py` prints the review (by person, category, device,
   day and hour, most-queued shows, failures); `--markdown` gives a Discord-ready block and
   `--json out.json` the raw tables. Delete the file before the party for a clean weekend.
+
+- **The secret menu.** Type `@claude` in the search box: a gif and one Random button. A roll
+  queues one thing from the whole pool (a movie, an episode, an anime, or one of the YouTube
+  videos already downloaded that night) and is logged like any other request, flagged `random`.
+  The first roll after each server start is always Terminator 2 (`FIRST_ROLL_TITLE`, matched
+  against the start of a movie title; blank to disable), after which the dice are honest. The
+  queue shows a roll as queued by Claude; the log keeps the real requester. The gif lives at
+  `static/dashing-driver-car.gif`; replace the file and the page picks it up on the next visit.
 
 ## Ideas / future features
 

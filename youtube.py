@@ -38,6 +38,14 @@ FORMAT = os.environ.get(
     "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[ext=m4a]/"
     "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best",
 )
+# The same ladder capped at 720p: music videos and anything from a playlist, where the wait
+# matters more than the pixels on a projector across the room.
+FORMAT_CAPPED = os.environ.get(
+    "YT_FORMAT_CAPPED",
+    "bestvideo[vcodec^=avc1][width<=720][height>720]+bestaudio[ext=m4a]/"
+    "bestvideo[vcodec^=avc1][height<=720]+bestaudio[ext=m4a]/"
+    "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[height<=720]/best",
+)
 SEARCH_RESULTS = int(os.environ.get("YT_SEARCH_RESULTS", "10"))
 CACHE_GB = float(os.environ.get("YT_CACHE_GB", "20"))  # trim oldest downloads beyond this
 CACHE_DAYS = float(os.environ.get("YT_CACHE_DAYS", "7"))  # and anything older than this
@@ -87,6 +95,12 @@ def playlist(url: str, limit: int = PLAYLIST_MAX) -> dict:
             "mix": is_mix, "entries": entries}
 
 
+def _env() -> dict:
+    """yt-dlp is a Python program: without this it writes titles in the console code page, so an
+    é came through as a replacement character and 【brackets】 vanished before we read them."""
+    return {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+
+
 def _base_cmd() -> list[str]:
     cmd = [YTDLP, "--no-playlist", "--no-warnings"]
     if DENO:
@@ -107,7 +121,7 @@ def _run(args: list[str], timeout: int = 45) -> str:
         raise HTTPException(status_code=501, detail="yt-dlp is not installed (pip install yt-dlp[default]).")
     try:
         r = subprocess.run(_base_cmd() + ["--quiet"] + args, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
+                           encoding="utf-8", errors="replace", timeout=timeout, env=_env())
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="YouTube took too long to answer.")
     if r.returncode != 0:
@@ -159,18 +173,32 @@ _META = "META\t%(id)s\t%(title)s\t%(duration)s\t%(uploader)s\t%(thumbnail)s\t%(i
 _PROGRESS = "PROGRESS\t%(progress._percent_str)s\t%(progress._eta_str)s"
 
 
-def download(url: str, on_progress: Callable[[dict], None] | None = None, timeout: int = 1800,
-             handle: dict | None = None) -> dict:
-    """Download (or reuse from cache) one video merged into a single file. Returns metadata + 'path'.
+def is_music(url: str) -> bool:
+    """YouTube files the video under the Music category. One quick metadata call, no download."""
+    try:
+        out = _run(["--skip-download", "--print", "%(categories)s", url.strip()], timeout=45)
+    except HTTPException:
+        return False
+    return "music" in out.lower()
 
-    on_progress is called with {"percent": float, "eta": str} as the download runs. If `handle`
-    is given, handle["proc"] is set to the yt-dlp process so a caller can cancel() it.
+
+def download(url: str, on_progress: Callable[[dict], None] | None = None, timeout: int = 1800,
+             handle: dict | None = None, cap: str | None = None) -> dict:
+    """Download (or reuse from cache) one video merged into a single file. Returns metadata + 'path'
+    + 'quality' ("1080p", or "720p (music)" / "720p (playlist)" when capped).
+
+    `cap` names a reason to use the 720p ladder ("playlist"); with none given, a video YouTube
+    files under Music is capped too. on_progress is called with {"percent": float, "eta": str}
+    as the download runs. If `handle` is given, handle["proc"] is set to the yt-dlp process so a
+    caller can cancel() it.
     """
     if not YTDLP:
         raise HTTPException(status_code=501, detail="yt-dlp is not installed (pip install yt-dlp[default]).")
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if cap is None and is_music(url):
+        cap = "music"
     cmd = _base_cmd() + [
-        "-f", FORMAT, "--merge-output-format", "mkv",
+        "-f", FORMAT_CAPPED if cap else FORMAT, "--merge-output-format", "mkv",
         "-o", str(CACHE_DIR / "%(id)s.%(ext)s"),
         "--no-overwrites", "--continue",
         "--newline", "--progress", "--progress-template", f"download:{_PROGRESS}",
@@ -179,7 +207,7 @@ def download(url: str, on_progress: Callable[[dict], None] | None = None, timeou
     ]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                encoding="utf-8", errors="replace")
+                                encoding="utf-8", errors="replace", env=_env())
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"Could not start yt-dlp: {e}")
     if handle is not None:
@@ -216,6 +244,7 @@ def download(url: str, on_progress: Callable[[dict], None] | None = None, timeou
     if proc.returncode != 0 or not path or not Path(path).exists():
         raise _fail(stderr, "Download failed")
     meta["path"] = path
+    meta["quality"] = f"720p ({cap})" if cap else "1080p"
     return meta
 
 

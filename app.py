@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -603,10 +604,14 @@ def group_for_uri(uri: str) -> tuple[str | None, dict | None]:
 
 
 def prune_groups(items: list[dict]) -> None:
-    """Forget groups with no member left in VLC's playlist."""
+    """Forget groups with no member left in VLC's playlist. A group that has no member *yet*
+    (a playlist whose first video is still downloading) is left alone for an hour."""
     present = {_path_key(x["uri"]) for x in items}
+    now = time.time()
     with groups_lock:
-        stale = [gid for gid, g in queue_groups.items() if not any(k in present for k in g["keys"])]
+        stale = [gid for gid, g in queue_groups.items()
+                 if (g["keys"] and not any(k in present for k in g["keys"]))
+                 or (not g["keys"] and now - g.get("created", now) > 3600)]
         for gid in stale:
             del queue_groups[gid]
         if stale:
@@ -737,13 +742,28 @@ def image_trim_cache() -> None:
                 pass
 
 
-def enqueue_uri(uri: str) -> None:
-    """in_enqueue that re-applies per-item VLC options (e.g. an image's display time)."""
+# VLC items queued on their own although their file also sits in a block (a cached video rolled
+# again by the dice, say): no block for them, and their own "queued by". Keyed by VLC id, which
+# rebuild_upcoming carries across a reorder because it re-adds the items itself.
+solo_items: dict[int, str | None] = {}
+_NOT_SOLO = object()
+
+
+def enqueue_uri(uri: str, *, solo: dict | None = None) -> int | None:
+    """in_enqueue that re-applies per-item VLC options (e.g. an image's display time). With
+    `solo={"queued_by": name}` the new item is marked as standing alone; returns its VLC id then."""
     item = extra_lookup(uri)
     params = {"command": "in_enqueue", "input": uri}
     if item and item.get("options"):
         params["option"] = item["options"]
     vlc("status.json", **params)
+    if solo is None:
+        return None
+    items = vlc_playlist()
+    if not items:
+        return None
+    solo_items[items[-1]["id"]] = solo.get("queued_by")
+    return items[-1]["id"]
 
 
 def _ffprobe_gif(path: Path) -> tuple[float, int]:
@@ -798,7 +818,7 @@ def yt_fetch_and_queue(job_id: str) -> None:
             job["thumbnail"] = p["meta"].get("thumbnail")
 
     try:
-        meta = youtube.download(job["url"], progress, handle=job)
+        meta = youtube.download(job["url"], progress, handle=job, cap="playlist" if job.get("playlist") else None)
         path = Path(meta["path"])
         remember_extra_item(path, {
             "title": meta["title"], "name": meta.get("uploader") or "YouTube", "poster": meta.get("thumbnail"),
@@ -818,7 +838,8 @@ def yt_fetch_and_queue(job_id: str) -> None:
         queue_event("youtube", name=job["user"], ip=job.get("ip"), device=job.get("device"), category="youtube",
                     title=meta["title"], url=meta["url"], uploader=meta.get("uploader") or None,
                     duration=meta.get("duration") or None, playlist=job.get("playlist"),
-                    playlist_index=job.get("index"), playlist_count=job.get("count"), started_playback=was_idle or None)
+                    playlist_index=job.get("index"), playlist_count=job.get("count"), quality=meta.get("quality"),
+                    started_playback=was_idle or None)
     except HTTPException as e:
         job.update({"status": "cancelled" if job.get("cancelled") else "error", "error": e.detail})
     except Exception as e:  # keep the job table sane whatever happens
@@ -916,7 +937,10 @@ def vlc_playlist() -> list[dict]:
             }
         else:
             info = {"name": fname or c.get("name", ""), "duration": c.get("duration", -1), **library.describe(uri)}
-        gid, grp = group_for_uri(uri)
+        solo = solo_items.get(int(c["id"]), _NOT_SOLO)
+        gid, grp = (None, None) if solo is not _NOT_SOLO else group_for_uri(uri)
+        if solo is not _NOT_SOLO:
+            info["queued_by"] = solo
         items.append({"id": int(c["id"]), "uri": uri, "current": c.get("current") == "current",
                       "group": gid, "group_label": grp["label"] if grp else None, **info})
     return items
@@ -927,7 +951,9 @@ def rebuild_upcoming(upcoming: list[dict], order: list[dict]) -> None:
     for x in upcoming:
         vlc("status.json", command="pl_delete", id=x["id"])
     for x in order:
-        enqueue_uri(x["uri"])
+        was_solo = x["id"] in solo_items
+        credit = solo_items.pop(x["id"], None)
+        enqueue_uri(x["uri"], solo={"queued_by": credit} if was_solo else None)
 
 
 def keep_group_together(gid: str) -> None:
@@ -1117,6 +1143,7 @@ class TrackRequest(BaseModel):
 
 class ReorderRequest(BaseModel):
     ids: list[int]
+    uris: list[str] | None = None  # the same items by file: survives VLC renumbering the queue under the page
 
 
 @app.get("/")
@@ -1277,9 +1304,12 @@ def poster(library_label: str, group: str):
 
 
 def enqueue(ids: list[str], user: str, *, ip: str | None = None, label: str = "",
-            device: str | None = None) -> dict:
+            device: str | None = None, rolled: bool = False, first_roll: bool = False,
+            credit: str | None = None) -> dict:
     """Add files to the end of VLC's playlist. Starts playback from the first one if VLC is idle.
-    Several files with a `label` (a season, "all of" a show) become one block in the queue."""
+    Several files with a `label` (a season, "all of" a show) become one block in the queue.
+    `credit` is shown as who queued it instead of the requester (the dice say "Claude"); the log
+    still names the real requester."""
     paths = [library.resolve(i) for i in ids]  # validate everything before touching VLC
     user = requester_name(ip, user)
     gid = new_group(label, "season", user or None) if label.strip() and len(ids) > 1 else None
@@ -1287,14 +1317,14 @@ def enqueue(ids: list[str], user: str, *, ip: str | None = None, label: str = ""
     first_new_id = None
     for item_id, path in zip(ids, paths):
         # Path.as_uri() percent-encodes spaces etc. so VLC gets a valid file:// MRL.
-        vlc("status.json", command="in_enqueue", input=path.as_uri())
+        enqueue_uri(path.as_uri(), solo={"queued_by": credit} if credit else None)
         if gid:
             group_add(gid, path.as_uri())
         if first_new_id is None and was_idle:
             items = vlc_playlist()
             first_new_id = items[-1]["id"] if items else None
         key = library.key_for_id(item_id)
-        library.queued_by[key] = user or None
+        library.queued_by[key] = credit or user or None
         log.info("Queued by %s: %s", user or "anonymous", item_id)
         g = library.by_relpath.get(key) or {}
         it = next((x for x in g.get("items", []) if x["id"] == item_id), {})
@@ -1302,6 +1332,7 @@ def enqueue(ids: list[str], user: str, *, ip: str | None = None, label: str = ""
                     library=key[0], title=g.get("title") or path.stem, year=g.get("year"), file=path.name,
                     season=it.get("season"), episode=it.get("episode"), extra=it.get("extra") or None,
                     block=label.strip() or None, batch=len(ids) if len(ids) > 1 else None,
+                    random=rolled or None, first_roll=first_roll or None,
                     started_playback=(was_idle and item_id == ids[0]) or None)
     what = paths[0].name if len(paths) == 1 else f"{len(paths)} episodes"
     if was_idle and first_new_id is not None:
@@ -1323,6 +1354,110 @@ def queue_batch(req: BatchQueueRequest, request: Request):
     if len(req.ids) > 200:
         raise HTTPException(status_code=400, detail="That's too many at once (max 200).")
     return enqueue(req.ids, req.user, ip=client_ip(request), label=req.label, device=device_kind(request))
+
+
+# --- The secret menu: type @claude in the search box -------------------------------------------
+RANDOM_KINDS = ("movie", "tv", "anime", "youtube")
+# The first roll after every server start isn't random at all. In memory on purpose: a restart
+# makes it "the first time" again.
+FIRST_ROLL_TITLE = os.environ.get("FIRST_ROLL_TITLE", "Terminator 2")
+DICE_NAME = "Claude"  # who the queue says picked a roll; the event log keeps the real requester
+first_roll = {"pending": bool(FIRST_ROLL_TITLE.strip())}
+
+
+def first_roll_pick() -> dict | None:
+    """The rigged first pick, if it is still owed and the library has the title; None otherwise.
+    An unscanned library keeps it owed, so the first roll after the scan still gets it."""
+    if not first_roll["pending"]:
+        return None
+    want = FIRST_ROLL_TITLE.strip().lower()
+    g = next((g for g in library.groups
+              if g["items"] and library_category(g["library"]) == "movie" and g["title"].lower().startswith(want)), None)
+    if g is not None:
+        files = [it for it in g["items"] if not it.get("extra")] or g["items"]
+        return {"kind": "movie", "id": files[0]["id"], "title": g["title"], "poster": g["poster"], "episode": None}
+    if library.scanned_at is not None:
+        return None  # scanned, and it isn't there
+    # The scan hasn't finished (the first roll often comes right after a start): look straight
+    # into the movie folders for a folder that starts with the title and take its biggest video.
+    for label, root in library.roots.items():
+        if library_category(label) != "movie":
+            continue
+        try:
+            folders = sorted((d for d in root.iterdir() if d.is_dir() and d.name.lower().startswith(want)),
+                             key=lambda d: d.name.lower())
+        except OSError:
+            continue
+        for d in folders:
+            videos = [f for f in d.rglob("*") if f.is_file() and f.suffix.lower() in VIDEO_EXTS]
+            if videos:
+                best = max(videos, key=lambda f: f.stat().st_size)
+                return {"kind": "movie", "id": f"{label}/{best.relative_to(root).as_posix()}",
+                        "title": parse_title(d.name)[0], "poster": None, "episode": None}
+    return None
+
+
+class RandomRequest(BaseModel):
+    kind: str = "any"  # movie | tv | anime | youtube | any
+    user: str = ""
+
+
+def random_pick(kind: str) -> dict:
+    """Choose something at random. Library kinds pick a title, then a non-extra file from it;
+    "youtube" picks from what has already been downloaded (so it's instant and never a dud)."""
+    if kind == "any":
+        kinds = [k for k in RANDOM_KINDS if random_pool(k)]
+        if not kinds:
+            raise HTTPException(status_code=404, detail="Nothing to roll from yet.")
+        kind = random.choice(kinds)
+    pool = random_pool(kind)
+    if not pool:
+        raise HTTPException(status_code=404, detail={
+            "youtube": "Nothing from YouTube has been downloaded yet; queue one the normal way first.",
+        }.get(kind, f"No {kind} titles in the library."))
+    pick = random.choice(pool)
+    if kind == "youtube":
+        key, info = pick
+        return {"kind": kind, "key": key, "title": info["title"], "poster": info.get("poster"), "youtube": info.get("youtube")}
+    g = pick
+    files = [it for it in g["items"] if not it.get("extra")] or g["items"]
+    it = random.choice(files)
+    return {"kind": kind, "id": it["id"], "title": g["title"], "poster": g["poster"],
+            "episode": Library.episode_label(g, library.key_for_id(it["id"]))}
+
+
+def random_pool(kind: str) -> list:
+    if kind == "youtube":
+        with yt_lock:
+            return [(k, v) for k, v in extra_items.items() if v.get("youtube") and Path(k).exists()]
+    return [g for g in library.groups if g["items"] and library_category(g["library"]) == kind]
+
+
+@app.post("/api/queue/random")
+def queue_random(req: RandomRequest, request: Request):
+    """Roll the dice and queue the result. Logged like any request, with random=true."""
+    if req.kind not in RANDOM_KINDS + ("any",):
+        raise HTTPException(status_code=400, detail="Unknown kind.")
+    ip, device = client_ip(request), device_kind(request)
+    rigged = first_roll_pick()
+    if rigged:
+        first_roll["pending"] = False
+        result = enqueue([rigged["id"]], req.user, ip=ip, device=device, rolled=True, first_roll=True, credit=DICE_NAME)
+        verb = "now playing" if result["message"].startswith("Now playing") else "queued"
+        return {"message": f"The dice say: {rigged['title']} ({verb})", **rigged}
+    pick = random_pick(req.kind)
+    if pick["kind"] == "youtube":
+        user = requester_name(ip, req.user)
+        was_idle = vlc("status.json").get("state") == "stopped"
+        enqueue_uri(Path(pick["key"]).as_uri(), solo={"queued_by": DICE_NAME})  # its own item, not back into the old block
+        play_last_if_idle(was_idle)
+        queue_event("youtube", name=user, ip=ip, device=device, category="youtube", title=pick["title"],
+                    url=pick.get("youtube"), cached=True, random=True, started_playback=was_idle or None)
+        return {"message": f"The dice say: {pick['title']} (from tonight's YouTube picks)", **pick}
+    result = enqueue([pick["id"]], req.user, ip=ip, device=device, rolled=True, credit=DICE_NAME)
+    what = pick["title"] + (f" · {pick['episode']}" if pick.get("episode") else "")
+    verb = "now playing" if result["message"].startswith("Now playing") else "queued"
+    return {"message": f"The dice say: {what} ({verb})", **pick}
 
 
 @app.delete("/api/queue/group/{gid}")
@@ -1347,10 +1482,26 @@ def reorder_queue(req: ReorderRequest):
     state = vlc("status.json").get("state")
     upcoming = upcoming_items(state, vlc_playlist())
     by_id = {x["id"]: x for x in upcoming}
-    if sorted(req.ids) != sorted(by_id):
+    if sorted(req.ids) == sorted(by_id):
+        order = [by_id[i] for i in req.ids]
+    elif req.uris:
+        # The ids are stale: every rebuild (a reorder, a playlist video landing) renumbers VLC's
+        # items. Match by file instead, first unmatched occurrence wins, and anything that arrived
+        # since the page rendered keeps its place at the end.
+        pool = list(upcoming)
+        order = []
+        for uri in req.uris:
+            match = next((x for x in pool if x["uri"] == uri), None)
+            if match is not None:
+                order.append(match)
+                pool.remove(match)
+        if not order:
+            raise HTTPException(status_code=409, detail="The queue changed, refresh and try again.")
+        order += pool
+    else:
         raise HTTPException(status_code=409, detail="The queue changed, refresh and try again.")
-    if [x["id"] for x in upcoming] != req.ids:
-        rebuild_upcoming(upcoming, [by_id[i] for i in req.ids])
+    if [x["id"] for x in upcoming] != [x["id"] for x in order]:
+        rebuild_upcoming(upcoming, order)
     return {"message": "Queue reordered", "queue": vlc_playlist()}
 
 
@@ -1361,6 +1512,8 @@ def status():
     meta = s.get("information", {}).get("category", {}).get("meta", {})
     queue = vlc_playlist()
     prune_groups(queue)
+    for stale in [i for i in solo_items if i not in {x["id"] for x in queue}]:
+        del solo_items[stale]
     current = next((x for x in queue if x["current"]), None)
     if current and (current.get("youtube") or current.get("image")):
         now_playing = current["name"]  # uploader / "Image · 15s"; VLC's own meta is just the cache filename
