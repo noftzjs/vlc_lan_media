@@ -5,3 +5,4 @@ __pycache__/
 cache/
 tools/*
 !tools/queue_report.py
+.pytest_cache/
