@@ -865,16 +865,15 @@
                 [`${items.length} item${items.length === 1 ? '' : 's'}`, total ? fmtDuration(total) : '', who ? `queued by ${who}` : ''].filter(Boolean).join(' · ');
         }
 
-        // The flat order the server wants: blocks contribute their items in place. Both the VLC ids
-        // and the files go, because VLC renumbers the queue on every rebuild and the ids may be stale.
+        // The flat order the server wants, as entry ids: blocks contribute their items in place.
         function queueOrder() {
-            const ids = [], uris = [];
-            const take = d => { ids.push(Number(d.dataset.id)); uris.push(d.dataset.uri); };
+            const ids = [];
+            const take = d => ids.push(d.dataset.id);
             for (const el of document.getElementById('queue').children) {
                 if (el.classList.contains('queue-group')) el.querySelectorAll('.queue-item').forEach(take);
                 else if (el.classList.contains('queue-item') && !el.classList.contains('current') && !el.classList.contains('pending')) take(el);
             }
-            return {ids, uris};
+            return {ids};
         }
 
         async function sendOrder() {

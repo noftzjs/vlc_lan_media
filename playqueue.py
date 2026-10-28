@@ -328,6 +328,11 @@ class PlayQueue:
             return entries
 
     # --- what the page shows ------------------------------------------------------------------
+    def view(self) -> tuple[Entry | None, list[Entry], dict[str, Block]]:
+        """(current, upcoming, blocks) as of one moment, for building the page's rows."""
+        with self._lock:
+            return self.current, list(self.upcoming), dict(self.blocks)
+
     def snapshot(self) -> dict:
         with self._lock:
             def row(e: Entry) -> dict:
