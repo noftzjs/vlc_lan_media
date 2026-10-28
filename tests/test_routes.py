@@ -248,3 +248,12 @@ def test_first_start_adopts_vlcs_playlist_once(env):
     env.vlc.add_foreign(files[0].as_uri())
     app.adopt_vlc_playlist()  # the queue file exists now: never again
     assert len(env.q.upcoming) == 2
+
+
+def test_youtube_items_have_no_track_selector(env):
+    queue_mix(env)
+    env.ff.finish()
+    env.feeder.tick()
+    assert env.client.get("/api/tracks").json()["audio"] == []
+    r = env.client.post("/api/tracks", json={"kind": "audio", "id": -1})
+    assert r.status_code == 409 and env.vlc.audio[env.vlc.current] == 1  # still on track 1

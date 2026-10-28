@@ -8,9 +8,9 @@ Queue rebuild (spec: docs/queue_rebuild.md, branch jn/youtube-queue-rebuild; cut
 - [ ] Check the feeder against real VLC once wired in: stop vs end detection, image items (length 0), what VLC reports after the last item ends
 - [x] Downloader: youtube.py around the queue-order worker (two at a time, cached files skip yt-dlp, 720p cap rules), tested against a fake yt-dlp
 - [x] Routes in app.py on the new queue; delete the old group code, solo tracking, rebuild/keep-together and pruning; adopt VLC's playlist on first start; log block id and download results via the downloader's on_finish; wake the downloader on add/move/remove
-- [ ] Front end: in-block reordering, block ✕ and item ✕ on entry ids, pending/failed rows (routes keep the old status shape; downloading entries are queue rows with status/percent, `pending` now only carries failures; drop the stale `dataset.uri`)
+- [x] Front end: downloading entries are draggable rows with progress, failure notices, "waiting for the next download", no track dropdown for YouTube
 - [ ] Library files have no duration in the queue now (it came from VLC's playlist, which holds two items): probe it at queue time or from the scan, for the time-left total
-- [ ] TESTING.md still describes the old playlist downloads (one at a time, cancel stops the rest): rewrite those steps before the run
+- [x] TESTING.md rewritten for the new queue: rebuild bugs, restart, cutover adoption
 - [ ] Full TESTING.md run, then merge
 
 ## Inbox

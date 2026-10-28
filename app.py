@@ -1473,6 +1473,10 @@ def remove_from_queue(item_id: str, request: Request):
 
 
 def tracks_with_pref() -> dict:
+    cur = play_queue.current
+    if cur is not None and cur.kind != "file":
+        # YouTube items always play track 1 (the feeder sees to it) and images have none: no selector.
+        return {"audio": [], "subtitle": [], "pref": {"title": None, "audio": None, "subtitle": None}}
     t = vlc("tracks.json")
     key, g = current_show_key()
     p = track_prefs.get(key) if key else {}
@@ -1496,6 +1500,9 @@ def select_track(req: TrackRequest):
     cmd = {"audio": "audio_track", "subtitle": "subtitle_track"}.get(req.kind)
     if not cmd:
         raise HTTPException(status_code=400, detail="kind must be 'audio' or 'subtitle'.")
+    cur = play_queue.current
+    if cur is not None and cur.kind != "file":
+        raise HTTPException(status_code=409, detail="YouTube videos always play their first audio track.")
     before = vlc("tracks.json")
     vlc("tracks.json", command=cmd, val=req.id)
     key, g = current_show_key()
