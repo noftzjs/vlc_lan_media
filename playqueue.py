@@ -255,6 +255,32 @@ class PlayQueue:
             self._save()
             return self.current
 
+    def begin(self, entry_id: str) -> Entry | None:
+        """VLC started this entry: what was playing goes to history and this entry
+        becomes current, wherever it is in the queue (VLC can move on to the item
+        the feeder preloaded a moment before a reorder changed the front)."""
+        with self._lock:
+            entry = next((e for e in self.upcoming if e.id == entry_id), None)
+            if entry is None:
+                return None
+            if self.current is not None:
+                self.history.append(self.current)
+            self.upcoming.remove(entry)
+            self.current = entry
+            self.upcoming = normalize(self.upcoming, front=entry.block)
+            self._drop_empty_blocks()
+            self._save()
+            return entry
+
+    def requeue_current(self) -> Entry | None:
+        """Stop: what was playing goes back to the front, so play starts it again."""
+        with self._lock:
+            entry, self.current = self.current, None
+            if entry is not None:
+                self.upcoming.insert(0, entry)
+                self._save()
+            return entry
+
     def stopped(self) -> None:
         """Playback stopped with nothing after it: what was playing goes to history."""
         with self._lock:

@@ -281,3 +281,24 @@ def test_bad_kinds_are_refused():
         q.add_block("x", "album", [song("a", "a")])
     with pytest.raises(ValueError):
         q.add_block("x", "mix", [])
+
+
+def test_begin_takes_an_entry_from_anywhere_and_keeps_its_block_first():
+    q = make_queue()
+    movie = q.add("file", "Movie", path="m")
+    block, (s1, s2) = mix(q, n=2)
+    assert q.begin(s1.id) is s1  # VLC played the preloaded song after a reorder put the movie first
+    assert order(q) == ["Mix - Queen 2", "Movie"]
+    assert q.begin("not-queued") is None and q.current is s1
+    q.begin(s2.id)
+    assert [e.title for e in q.history] == ["Mix - Queen 1"]
+
+
+def test_requeue_current_puts_it_back_at_the_front():
+    q = make_queue()
+    q.add("file", "A", path="a")
+    q.add("file", "B", path="b")
+    q.advance()
+    assert q.requeue_current().title == "A"
+    assert q.current is None and order(q) == ["A", "B"] and not q.history
+    assert q.requeue_current() is None
