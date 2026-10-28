@@ -5,6 +5,10 @@ stream URLs gives picture but no sound (the DASH audio never decodes). So we dow
 with yt-dlp, which merges video + audio with ffmpeg into one file in cache/youtube/, and queue
 that like any other file. Short clips take a few seconds. yt-dlp needs a JavaScript runtime for
 YouTube's checks; start.ps1 drops a portable Deno in tools/deno.
+
+``Downloader`` is the queue's download worker (docs/queue_rebuild.md): it fetches the queue's
+pending YouTube entries in queue order, two at a time, uses a video already in the cache
+without calling yt-dlp, and reports each entry ready or failed back to the queue.
 """
 
 import logging
@@ -13,9 +17,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 from fastapi import HTTPException
 
@@ -121,7 +127,7 @@ def _run(args: list[str], timeout: int = 45) -> str:
         raise HTTPException(status_code=501, detail="yt-dlp is not installed (pip install yt-dlp[default]).")
     try:
         r = subprocess.run(_base_cmd() + ["--quiet"] + args, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout, env=_env())
+                           encoding="utf-8", errors="replace", timeout=timeout, env=_env(), check=False)
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="YouTube took too long to answer.")
     if r.returncode != 0:
@@ -273,19 +279,25 @@ def discard_partial(video_id: str | None) -> None:
                 pass
 
 
+def _path_key(path: str | Path) -> str:
+    return str(path).replace("\\", "/").lower().strip("/")
+
+
 def trim_cache(keep: set[str] = frozenset()) -> None:
     """Keep the download cache under CACHE_GB and drop files older than CACHE_DAYS.
 
-    `keep` holds lowercased paths that must survive (anything still in VLC's playlist).
+    `keep` holds paths that must survive (anything still in the queue), in any case or
+    slash style.
     """
     if not CACHE_DIR.exists():
         return
+    keep = {_path_key(k) for k in keep}
     files = sorted((f for f in CACHE_DIR.iterdir() if f.is_file() and not f.name.endswith(".part")),
                    key=lambda f: f.stat().st_mtime)
     now = time.time()
     total = sum(f.stat().st_size for f in files)
     for f in files:
-        if str(f).replace("\\", "/").lower() in keep:
+        if _path_key(f) in keep:
             continue
         too_old = now - f.stat().st_mtime > CACHE_DAYS * 86400
         if too_old or total > CACHE_GB * 1e9:
@@ -295,3 +307,190 @@ def trim_cache(keep: set[str] = frozenset()) -> None:
                 log.info("Removed cached YouTube download %s", f.name)
             except OSError:
                 pass
+
+
+# --- the queue's download worker ---------------------------------------------------------------
+SLOTS = int(os.environ.get("YT_SLOTS", "2"))  # downloads running at once
+_VID_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/|/live/|/embed/)([A-Za-z0-9_-]{11})")
+# what yt-dlp leaves while it works: x.mkv.part, x.f137.mp4, x.ytdl, x.temp.mkv
+_PARTIAL_RE = re.compile(r"\.(part|ytdl)$|\.f\d+\.|\.temp\.")
+
+
+def video_id_of(url: str) -> str | None:
+    m = _VID_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def cached_file(video_id: str) -> str | None:
+    """The finished download of this video, if the cache has one. Its time is touched so
+    the 7-day trim counts from the last use, not the first download."""
+    if not video_id or not CACHE_DIR.exists():
+        return None
+    for f in CACHE_DIR.iterdir():
+        if f.is_file() and f.name.split(".", 1)[0] == video_id and not _PARTIAL_RE.search(f.name):
+            try:
+                os.utime(f)
+            except OSError:
+                pass
+            return str(f)
+    return None
+
+
+@dataclass
+class Job:
+    """One yt-dlp run. Entries queueing the same video share it."""
+
+    key: str  # the video id (or the url, if no id could be read from it)
+    url: str
+    cap: str | None
+    entry_ids: set[str]
+    handle: dict = field(default_factory=dict)  # download() puts the process here; cancel() kills it
+    percent: float = 0.0
+    eta: str = ""
+
+
+class Downloader:
+    """Fetches the queue's pending YouTube entries, in queue order, ``slots`` at a time.
+
+    Each tick looks at the queue afresh, so a reorder changes what starts next (nothing
+    running is interrupted for it), and a download nothing queued needs any more (its
+    entries were removed) is killed. An entry whose video is cached becomes ready at
+    once, without yt-dlp. ``fetch``/``kill``/``cached``/``trim``/``spawn`` default to the
+    real thing; tests pass fakes.
+    """
+
+    def __init__(
+        self,
+        queue,
+        fetch: Callable[..., dict] | None = None,
+        kill: Callable[[dict], bool] | None = None,
+        cached: Callable[[str], str | None] | None = None,
+        trim: Callable[[set[str]], None] | None = None,
+        slots: int = SLOTS,
+        on_finish: Callable[[list, dict | None, str | None], None] | None = None,
+        spawn: Callable[[Callable[[], None]], None] | None = None,
+    ):
+        self.queue = queue
+        self.slots = slots
+        self.on_finish = on_finish  # (entries, meta or None, error or None), for the request log
+        self._fetch = fetch or download
+        self._kill = kill or cancel
+        self._cached = cached or cached_file
+        self._trim = trim or trim_cache
+        self._spawn = spawn or _thread
+        self._lock = threading.RLock()
+        self.jobs: dict[str, Job] = {}
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+
+    # --- the loop -------------------------------------------------------------------------
+    def start(self, interval: float = 2.0) -> threading.Thread:
+        def run():
+            while not self._stop.is_set():
+                try:
+                    self.tick()
+                except Exception as e:  # noqa: BLE001 - one bad entry must not stop every download
+                    log.warning("downloader tick failed: %s", e)
+                self._wake.wait(interval)
+                self._wake.clear()
+
+        t = threading.Thread(target=run, name="yt-downloader", daemon=True)
+        t.start()
+        return t
+
+    def wake(self) -> None:
+        """Something was queued, moved or removed: look now rather than at the next tick."""
+        self._wake.set()
+
+    def stop_loop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def tick(self) -> None:
+        with self._lock:
+            self._drop_unneeded()
+            for entry in self.queue.pending():
+                if entry.kind != "youtube":
+                    continue
+                vid = entry.video_id or video_id_of(entry.url or "")
+                key = vid or entry.url
+                if not key:
+                    self.queue.set_status(entry.id, "failed", error="No YouTube link for this entry")
+                    continue
+                job = self.jobs.get(key)
+                if job is not None:  # the same video is already downloading: share it
+                    job.entry_ids.add(entry.id)
+                    self.queue.set_status(entry.id, "downloading")
+                    continue
+                path = self._cached(vid) if vid else None
+                if path:
+                    self.queue.set_status(entry.id, "ready", path=path)
+                    continue
+                if len(self.jobs) < self.slots:
+                    self._begin(entry, key, vid)
+
+    def progress(self) -> dict[str, dict]:
+        """entry id -> {"percent", "eta"} for the entries downloading now."""
+        with self._lock:
+            return {
+                eid: {"percent": job.percent, "eta": job.eta}
+                for job in self.jobs.values()
+                for eid in job.entry_ids
+            }
+
+    # --- internals ----------------------------------------------------------------------------
+    def _begin(self, entry, key: str, vid: str | None) -> None:
+        url = entry.url or f"https://www.youtube.com/watch?v={vid}"
+        job = Job(key=key, url=url, cap=entry.cap, entry_ids={entry.id})
+        self.jobs[key] = job
+        self.queue.set_status(entry.id, "downloading")
+        self._spawn(lambda: self._run(job))
+
+    def _drop_unneeded(self) -> None:
+        """Kill downloads whose entries have all left the queue (removed by someone)."""
+        for key, job in list(self.jobs.items()):
+            job.entry_ids = {i for i in job.entry_ids if self.queue.get(i) is not None}
+            if not job.entry_ids:
+                del self.jobs[key]
+                self._kill(job.handle)
+                log.info("Download no longer queued, stopped: %s", job.url)
+
+    def _run(self, job: Job) -> None:
+        def on_progress(p: dict) -> None:
+            if "percent" in p:
+                job.percent = float(p["percent"])
+            if "eta" in p:
+                job.eta = p["eta"]
+
+        meta, error = None, None
+        try:
+            meta = self._fetch(job.url, on_progress, handle=job.handle, cap=job.cap)
+        except Exception as e:  # noqa: BLE001 - whatever went wrong, the entries must hear of it
+            error = str(getattr(e, "detail", "") or e or type(e).__name__)[:200]
+        with self._lock:
+            if self.jobs.get(job.key) is not job:
+                return  # stopped by _drop_unneeded: nothing queued wants it any more
+            del self.jobs[job.key]
+            entries = []
+            for eid in job.entry_ids:
+                if meta:
+                    extra = {k: meta[k] for k in ("duration", "thumbnail", "uploader", "quality") if meta.get(k)}
+                    got = self.queue.set_status(eid, "ready", path=meta["path"], **extra)
+                else:
+                    got = self.queue.set_status(eid, "failed", error=error or "Download failed")
+                if got is not None:
+                    entries.append(got)
+        if error:
+            log.warning("YouTube download failed for %s: %s", job.url, error)
+        if self.on_finish and entries:
+            self.on_finish(entries, meta, error)
+        if meta:
+            try:
+                self._trim(self.queue.in_use())
+            except OSError as e:
+                log.warning("cache trim failed: %s", e)
+        self.wake()  # a slot is free
+
+
+def _thread(fn: Callable[[], None]) -> None:
+    threading.Thread(target=fn, name="yt-download", daemon=True).start()

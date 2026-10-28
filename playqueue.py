@@ -204,6 +204,11 @@ class PlayQueue:
             free = max(0, slots - running)
             return [e for e in self.upcoming if e.status == "pending"][:free]
 
+    def pending(self) -> list[Entry]:
+        """Entries still waiting for their file, in queue order."""
+        with self._lock:
+            return [e for e in self.upcoming if e.status == "pending"]
+
     def set_status(self, entry_id: str, status: str, path: str | None = None, error: str | None = None, **meta) -> Entry | None:
         """The downloader's report. ``ready`` needs the file's path; ``failed``
         takes the entry out of the queue (shown in ``failed`` for a while) and its

@@ -6,8 +6,8 @@ Queue rebuild (spec: docs/queue_rebuild.md, branch jn/youtube-queue-rebuild; cut
 - [x] `playqueue.py`: entries, blocks, ordering rules, history, saving, with tests
 - [x] Feeder: the one thread that changes VLC's playlist (two-item window, follows VLC, track 1 for YouTube), tested against a fake VLC
 - [ ] Check the feeder against real VLC once wired in: stop vs end detection, image items (length 0), what VLC reports after the last item ends
-- [ ] Downloader: youtube.py around the queue-order worker (two at a time, cached files skip yt-dlp, 720p cap rules), tested against a fake yt-dlp
-- [ ] Routes in app.py on the new queue; delete the old group code, solo tracking, rebuild/keep-together and pruning; adopt VLC's playlist on first start
+- [x] Downloader: youtube.py around the queue-order worker (two at a time, cached files skip yt-dlp, 720p cap rules), tested against a fake yt-dlp
+- [ ] Routes in app.py on the new queue; delete the old group code, solo tracking, rebuild/keep-together and pruning; adopt VLC's playlist on first start; log block id and download results via the downloader's on_finish; wake the downloader on add/move/remove
 - [ ] Front end: in-block reordering, block ✕ and item ✕ on entry ids, pending/failed rows
 - [ ] Full TESTING.md run, then merge
 
