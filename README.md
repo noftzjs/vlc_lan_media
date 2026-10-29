@@ -196,6 +196,14 @@ Drag the ⠿ handle in "Up next" (works on touch). VLC's HTTP API has no "move" 
 the server removes the upcoming items and re-adds them in the new order; the playing item is
 never touched. Already-played items stay in VLC's playlist but are hidden from the page.
 
+## Known quirks
+
+Not the app's doing, and nothing to fix here; written down so nobody chases them again.
+
+- **VLC's audio stutters while you browse YouTube in Chrome on the projector PC.** Seen when a
+  paused video was still open in YouTube's mini player: hovering over other videos (which starts
+  their muted preview) made VLC's sound stutter or drop. Closing the mini player stopped it.
+
 ## Configuration
 
 Settings are read from `.env` (see `.env.example`) or environment variables, with defaults in `app.py`:

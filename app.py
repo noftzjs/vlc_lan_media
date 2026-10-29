@@ -962,18 +962,20 @@ def start_playback() -> None:
 
 def track_watcher() -> None:
     """Re-apply the remembered audio/subtitle choice each time a new item starts playing."""
-    handled_plid = None
+    handled = None  # (entry id, VLC id): an entry restarted after stop gets a new VLC id
     attempts = 0
     while True:
         time.sleep(1)
         try:
             s = vlc("status.json")
             plid = s.get("currentplid", -1)
-            if s.get("state") == "stopped" or plid in (-1, handled_plid):
-                continue
             cur = play_queue.current
-            if cur is not None and cur.kind != "file":
-                handled_plid = plid  # the feeder sets YouTube's track; images have none
+            if s.get("state") == "stopped" or cur is None or (cur.id, plid) == handled:
+                continue
+            if feeder.owned.get(plid) != cur.id:
+                continue  # VLC moved on and the feeder hasn't caught up: cur is still the last item
+            if cur.kind != "file":
+                handled = (cur.id, plid)  # the feeder sets YouTube's track; images have none
                 continue
             key, g = current_show_key()
             prefs = track_prefs.get(key) if key else {}
@@ -991,7 +993,16 @@ def track_watcher() -> None:
                 if want is not None and want != have:
                     vlc("tracks.json", command={"audio": "audio_track", "subtitle": "subtitle_track"}[kind], val=want)
                     log.info("Track watcher: %s -> %s for %s", kind, want, g["title"])
-            handled_plid, attempts = plid, 0
+            # Never start an item silent: with no remembered audio choice, a file that came up
+            # with audio disabled gets its first real track (vlcrc's audio-track settings did this).
+            if not prefs.get("audio"):
+                audio = tracks.get("audio", [])
+                have = next((t["id"] for t in audio if t["current"]), -1)
+                first = next((t["id"] for t in audio if t["id"] != -1), None)
+                if have == -1 and first is not None:
+                    vlc("tracks.json", command="audio_track", val=first)
+                    log.info("Track watcher: audio was disabled, enabled track %s", first)
+            handled, attempts = (cur.id, plid), 0
         except HTTPException:
             pass  # VLC down or started without vlc_http; try again next tick
         except Exception as e:  # never let the watcher die

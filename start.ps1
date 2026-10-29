@@ -51,9 +51,11 @@ if (-not (Get-Process vlc -ErrorAction SilentlyContinue)) {
         "--http-password", $VlcPassword,
         "--lua-config", "http={dir='$VlcHttpDir'}",
         "--audio-language", "eng,en",     # VLC ignores this for many MKVs; the app's track memory covers it
+        "--audio-track=-1", "--audio-track-id=-1",  # vlcrc had audio-track=1 / audio-track-id=2 saved: files started silent
         "--fullscreen",
         "--no-video-title-show",
         "--no-interact",                  # no modal error dialogs: an unplayable item is skipped, not a frozen player
+        "--no-random", "--no-loop", "--no-repeat",  # the app's feeder needs VLC to play its list in order
         "--qt-minimal-view"
     )
     # Wait until VLC's web interface answers (up to ~15s) so the app doesn't start against nothing.

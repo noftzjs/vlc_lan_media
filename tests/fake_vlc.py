@@ -20,6 +20,7 @@ class FakeVlc:
         self.lengths = lengths or {}
         self.default_length = default_length
         self.audio: dict[int, int] = {}  # VLC id -> selected audio track id
+        self.modes = {"random": False, "repeat": False, "loop": False}  # toggled by pl_<mode>
         self.calls: list[tuple] = []
 
     # --- helpers for tests ------------------------------------------------------------------
@@ -80,6 +81,9 @@ class FakeVlc:
                 self.state = "paused"
             elif self.state == "paused":
                 self.state = "playing"
+        elif cmd in ("pl_random", "pl_repeat", "pl_loop"):
+            mode = cmd[3:]
+            self.modes[mode] = not self.modes[mode]
         elif cmd is not None:
             raise ValueError(cmd)
         playing = self.state != "stopped" and self.current is not None
@@ -88,6 +92,7 @@ class FakeVlc:
             "currentplid": self.current if playing else -1,
             "time": int(self.time),
             "length": int(self.length_of(self.current)) if playing else 0,
+            **self.modes,
         }
 
     # --- internals ------------------------------------------------------------------------------

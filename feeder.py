@@ -84,6 +84,7 @@ class Feeder:
     def tick(self) -> None:
         with self._lock:
             status = self.vlc("status.json")
+            self._in_order(status)
             items = flatten_playlist(self.vlc("playlist.json"))
             state = status.get("state", "stopped")
             plid = status.get("currentplid", -1)
@@ -99,6 +100,15 @@ class Feeder:
             if not playing and self.autoplay:
                 self._play_next()
             self._audio_track()
+
+    def _in_order(self, status: dict) -> None:
+        """The two-item window relies on VLC playing straight down its list. Shuffle
+        (saved in vlcrc, or toggled at the projector) makes pl_next restart the playing
+        item about half the time; repeat and loop replay it. Switch them off."""
+        for flag, cmd in (("random", "pl_random"), ("repeat", "pl_repeat"), ("loop", "pl_loop")):
+            if status.get(flag):
+                self.vlc("status.json", command=cmd)
+                log.info("feeder: VLC had %s on; switched it off", flag)
 
     # --- following VLC ----------------------------------------------------------------------
     def _follow(self, plid: int, status: dict) -> None:

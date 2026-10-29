@@ -59,6 +59,17 @@ def test_plays_the_queue_in_order_holding_two_items_at_most(tmp_path):
     assert [e for e in events if e[0] == "start"] == [("start", "A"), ("start", "B"), ("start", "C")]
 
 
+def test_shuffle_repeat_and_loop_are_switched_off(tmp_path):
+    # With shuffle on (vlcrc random=1), real VLC's pl_next restarted the playing item
+    # about half the time: "next" replayed the same song.
+    q, vlc, f, _ = setup(tmp_path)
+    vlc.modes.update(random=True, repeat=True, loop=True)
+    f.tick()
+    assert vlc.modes == {"random": False, "repeat": False, "loop": False}
+    f.tick()
+    assert vlc.modes == {"random": False, "repeat": False, "loop": False}  # not toggled back on
+
+
 def test_the_next_entry_is_preloaded_right_after_the_playing_one(tmp_path):
     q, vlc, f, _ = setup(tmp_path)
     for n in ("a", "b", "c"):
