@@ -59,8 +59,12 @@
         .queue-item .title { font-weight: bold; }
         .queue-item .file { color: #888; font-size: .78rem; word-break: break-all; }
         .queue-item.pending { opacity: .75; }
-        .queue-item.pending .handle { cursor: default; color: #ff5722; }
-        .queue-item.pending.error .handle { color: #e53935; }
+        .queue-item.pending .handle { cursor: default; color: #e53935; }
+        /* Queued but not downloaded yet: draggable like anything else (moving it up moves its download up). */
+        .queue-item.downloading .file { color: #ff9800; }
+        .queue-item.downloading .poster { opacity: .6; }
+        .queue-item .dl-bar { height: 3px; background: #333; border-radius: 2px; margin-top: 4px; overflow: hidden; }
+        .queue-item .dl-bar span { display: block; height: 100%; background: #ff9800; transition: width .5s; }
         .queue-item.sortable-ghost { opacity: .3; }
         .queue-item.sortable-chosen { background: #2a2a2a; }
         .queue-item.sortable-fallback { opacity: .9; box-shadow: 0 4px 16px #000a; border-radius: 8px; }
@@ -328,7 +332,7 @@
             grid.className = 'grid wide';
             grid.innerHTML = '';
             if (ytPlaylist) {
-                // The pasted link is a playlist: offer the whole thing (downloaded one at a time, queued as a block).
+                // The pasted link is a playlist: offer the whole thing, queued at once as one block.
                 const card = document.createElement('div');
                 card.className = 'card wide';
                 const meta = document.createElement('div');
@@ -414,7 +418,7 @@
                 btn.disabled = true;
                 try {
                     const data = await api('/api/queue/youtube', {method: 'POST', body: JSON.stringify({url: v.url, user: nameBox.value.trim(), title: v.title})});
-                    toast(data.message + ' — it joins the queue when the download finishes');
+                    toast(data.message + ' — it plays once downloaded');
                     closeSheet();
                     if (ytPlaylist) {
                         // A playlist stays on screen so a few more can be picked; the one just queued gets a tag.
@@ -636,8 +640,9 @@
                 const s = await api('/api/status');
                 document.getElementById('now-title').textContent = s.title || s.now_playing || 'Nothing playing';
                 document.getElementById('now-file').textContent = s.title ? s.now_playing : '';
-                document.getElementById('now-state').textContent =
-                    s.state + (s.length ? ` · ${fmtTime(s.time)} / ${fmtTime(s.length)}` : '');
+                document.getElementById('now-state').textContent = s.waiting
+                    ? 'waiting for the next download to finish'
+                    : s.state + (s.length ? ` · ${fmtTime(s.time)} / ${fmtTime(s.length)}` : '');
                 document.getElementById('progress-bar').style.width = s.length ? (100 * s.time / s.length) + '%' : '0';
                 const np = document.getElementById('now-poster');
                 if (np.dataset.src !== (s.poster || '')) {
@@ -740,20 +745,22 @@
             // Hide already-played items: show the current one and everything after it.
             const cur = queue.findIndex(q => q.current);
             const visible = (state === 'stopped' || cur < 0) ? queue : queue.slice(cur);
-            const key = JSON.stringify([visible.map(q => [q.id, q.current && state !== 'stopped', q.queued_by, q.group]),
-                                        pending.map(p => [p.id, Math.round(p.percent), p.status])]);
+            const key = JSON.stringify([visible.map(q => [q.id, q.current && state !== 'stopped', q.queued_by, q.group,
+                                                          q.status, Math.round(q.percent || 0)]),
+                                        pending.map(p => p.id)]);
             if (container.dataset.key === key) return;  // nothing changed, don't disturb the DOM
             container.dataset.key = key;
             container.innerHTML = '';
             if (!visible.length && !pending.length) { container.innerHTML = '<div class="muted">Queue is empty</div>'; return; }
             renderQueueItems(container, visible, state);
-            // YouTube downloads in progress sit at the bottom until they join the real queue.
+            // Downloads that failed: out of the queue already (a block carries on without them), shown
+            // here for a while so the person who queued them sees why.
             for (const p of pending) {
                 const div = document.createElement('div');
-                div.className = 'queue-item pending' + (p.status === 'error' ? ' error' : '');
+                div.className = 'queue-item pending error';
                 const icon = document.createElement('span');
                 icon.className = 'handle';
-                icon.textContent = p.status === 'error' ? '!' : '⇣';
+                icon.textContent = '!';
                 const text = document.createElement('div');
                 text.className = 'text';
                 const title = document.createElement('div');
@@ -761,26 +768,17 @@
                 title.textContent = p.title;
                 const sub = document.createElement('div');
                 sub.className = 'file';
-                sub.textContent = p.status === 'error' ? `Failed: ${p.error}`
-                    : p.status === 'cancelled' ? 'Download cancelled'
-                    : p.status === 'queued' ? 'Downloaded, added to queue'
-                    : `Fetching from YouTube · ${Math.round(p.percent)}%` + (p.eta ? ` · ${p.eta} left` : '') + (p.user ? ` · queued by ${p.user}` : '');
+                sub.textContent = `Download failed: ${p.error}` + (p.user ? ` · queued by ${p.user}` : '');
                 text.append(title, sub);
-                div.append(icon, posterEl(p.thumbnail, '', 'thumb'), text);
-                if (p.status === 'error' || p.status === 'fetching') {
-                    const btn = document.createElement('button');
-                    btn.className = 'danger';
-                    btn.textContent = '✕';
-                    btn.title = p.status === 'fetching' ? 'Cancel download' : 'Dismiss';
-                    btn.onclick = async () => {
-                        try {
-                            const data = await api('/api/youtube/jobs/' + p.id, {method: 'DELETE'});
-                            if (p.status === 'fetching') toast(data.message);
-                            container.dataset.key = ''; refreshStatus();
-                        } catch (e) { toast(e.message, true); }
-                    };
-                    div.appendChild(btn);
-                }
+                const btn = document.createElement('button');
+                btn.className = 'danger';
+                btn.textContent = '✕';
+                btn.title = 'Dismiss';
+                btn.onclick = async () => {
+                    try { await api('/api/youtube/jobs/' + p.id, {method: 'DELETE'}); container.dataset.key = ''; refreshStatus(); }
+                    catch (e) { toast(e.message, true); }
+                };
+                div.append(icon, posterEl(p.thumbnail, '', 'thumb'), text, btn);
                 container.appendChild(div);
             }
         }
@@ -861,20 +859,21 @@
             const items = block._items;
             const total = items.reduce((t, q) => t + Math.max(0, q.duration || 0), 0);
             const who = (items.find(q => q.queued_by) || {}).queued_by;
+            const fetching = items.filter(q => q.status === 'pending' || q.status === 'downloading').length;
             block.querySelector('.group-head .file').textContent =
-                [`${items.length} item${items.length === 1 ? '' : 's'}`, total ? fmtDuration(total) : '', who ? `queued by ${who}` : ''].filter(Boolean).join(' · ');
+                [`${items.length} item${items.length === 1 ? '' : 's'}`, total ? fmtDuration(total) : '',
+                 fetching ? `${fetching} downloading` : '', who ? `queued by ${who}` : ''].filter(Boolean).join(' · ');
         }
 
-        // The flat order the server wants: blocks contribute their items in place. Both the VLC ids
-        // and the files go, because VLC renumbers the queue on every rebuild and the ids may be stale.
+        // The flat order the server wants, as entry ids: blocks contribute their items in place.
         function queueOrder() {
-            const ids = [], uris = [];
-            const take = d => { ids.push(Number(d.dataset.id)); uris.push(d.dataset.uri); };
+            const ids = [];
+            const take = d => ids.push(d.dataset.id);
             for (const el of document.getElementById('queue').children) {
                 if (el.classList.contains('queue-group')) el.querySelectorAll('.queue-item').forEach(take);
                 else if (el.classList.contains('queue-item') && !el.classList.contains('current') && !el.classList.contains('pending')) take(el);
             }
-            return {ids, uris};
+            return {ids};
         }
 
         async function sendOrder() {
@@ -890,9 +889,9 @@
         function queueItemEl(item, isCurrent, container, inBlock = false) {
             {
                 const div = document.createElement('div');
-                div.className = 'queue-item' + (isCurrent ? ' current' : '');
+                const fetching = item.status === 'pending' || item.status === 'downloading';
+                div.className = 'queue-item' + (isCurrent ? ' current' : '') + (fetching ? ' downloading' : '');
                 div.dataset.id = item.id;
-                div.dataset.uri = item.uri;
                 const handle = document.createElement('span');
                 handle.className = inBlock ? 'handle in-handle' : 'handle';
                 handle.textContent = isCurrent ? '▶' : '⠿';
@@ -905,10 +904,18 @@
                 file.className = 'file';
                 file.textContent = [item.title ? item.name : '', item.queued_by ? `queued by ${item.queued_by}` : ''].filter(Boolean).join(' · ');
                 text.append(title, file);
+                if (item.status === 'downloading') {
+                    const bar = document.createElement('div');
+                    bar.className = 'dl-bar';
+                    const fill = document.createElement('span');
+                    fill.style.width = Math.max(2, Math.round(item.percent || 0)) + '%';
+                    bar.appendChild(fill);
+                    text.appendChild(bar);
+                }
                 const btn = document.createElement('button');
                 btn.className = 'danger';
                 btn.textContent = '✕';
-                btn.title = 'Remove from queue';
+                btn.title = fetching ? 'Remove from queue (stops the download)' : 'Remove from queue';
                 btn.onclick = async () => {
                     try { await api('/api/queue/' + item.id, {method: 'DELETE'}); container.dataset.key = ''; refreshStatus(); }
                     catch (e) { toast(e.message, true); }
@@ -921,7 +928,7 @@
         Sortable.create(document.getElementById('queue'), {
             draggable: '.queue-item, .queue-group',
             handle: '.handle:not(.in-handle)',   // a block's own handle, or a loose item's; items inside blocks have their own list
-            filter: '.current, .pending',   // the playing item stays put; downloads aren't in VLC yet
+            filter: '.current, .pending',   // the playing item stays put; failure notices aren't queue entries
             preventOnFilter: false,
             animation: 150,
             delay: 150, delayOnTouchOnly: true,   // let phones scroll without grabbing items

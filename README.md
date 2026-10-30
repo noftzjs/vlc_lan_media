@@ -55,18 +55,22 @@ leave VLC's own web interface bound to localhost (the start script does this).
 ## Blocks, credit and playlists
 
 - **Queue season / Queue all** put the episodes in the queue as one block: a header that drags the
-  whole thing, the episodes reorderable inside it, one ✕ to drop it all. A YouTube playlist is a
-  block too.
-- **Paste a playlist link** in the YouTube search and a "Queue playlist" card appears. Its videos
-  are downloaded one at a time (so a playlist never hogs the three download slots) and each one
-  joins the block as it lands; the first `YT_PLAYLIST_MAX` (default 25) are taken, in playlist order.
-  Cancelling the running download from Up next stops the rest. Playlist videos, and any single
+  whole thing, the episodes reorderable inside it, one ✕ to drop it all. A YouTube playlist or Mix
+  is a block too. Every add makes a new block, removing one is final, and nothing can be dropped
+  between a block's items. The app owns the queue (`cache/queue.json`, restored on restart); VLC
+  only ever holds what is playing and the next item. Design: `docs/queue_rebuild.md`.
+- **Paste a playlist link** in the YouTube search and a "Queue playlist" card appears. The first
+  `YT_PLAYLIST_MAX` (default 25) videos are snapshotted into the block at once, in playlist order,
+  and download in queue order, `YT_SLOTS` (default 2) at a time; a video already in the cache is
+  used without downloading. Playback waits for the next song of a block rather than skipping it,
+  and a song that fails to download drops out. Removing a song still downloading stops its
+  download. Playlist videos, and any single
   video YouTube files under Music, are fetched at 720p instead of 1080p (`YT_FORMAT_CAPPED`) so
   the wait stays short; everything else keeps the full ladder (`YT_FORMAT`).
 - **Every request is logged privately** to `cache/queue_events.jsonl`: time, what was queued
   (title, category: movie / tv / anime / youtube / image, season and episode, playlist or block),
   who asked (the name typed, else the name that LAN address used before: `cache/requesters.json`),
-  the address, and whether it came from a phone or a PC. A watcher also records how each item
+  the address, and whether it came from a phone or a PC, plus the block id. The feeder also records how each item
   ended: watched to the end, or skipped at what point and by whom (the last next / stop / remove
   within a few seconds gets the credit), plus removals from the queue. Nothing from it is shown
   on the page.
@@ -192,6 +196,14 @@ Drag the ⠿ handle in "Up next" (works on touch). VLC's HTTP API has no "move" 
 the server removes the upcoming items and re-adds them in the new order; the playing item is
 never touched. Already-played items stay in VLC's playlist but are hidden from the page.
 
+## Known quirks
+
+Not the app's doing, and nothing to fix here; written down so nobody chases them again.
+
+- **VLC's audio stutters while you browse YouTube in Chrome on the projector PC.** Seen when a
+  paused video was still open in YouTube's mini player: hovering over other videos (which starts
+  their muted preview) made VLC's sound stutter or drop. Closing the mini player stopped it.
+
 ## Configuration
 
 Settings are read from `.env` (see `.env.example`) or environment variables, with defaults in `app.py`:
@@ -222,12 +234,14 @@ Settings are read from `.env` (see `.env.example`) or environment variables, wit
 | POST   | `/api/queue/batch` `{ids, user?}` | Enqueue several in order (max 200), e.g. a season           |
 | POST   | `/api/queue/image` (multipart: `file`, `user?`, `duration?`) | Upload an image and queue it for `duration` seconds (-1 = until skipped) |
 | GET    | `/api/youtube/search?q=`        | YouTube search results, or the video behind a pasted link      |
-| POST   | `/api/queue/youtube` `{url, user?, title?}` | Download a YouTube video in the background and queue it when done; progress appears in `/api/status` `pending` |
+| POST   | `/api/queue/youtube` `{url, user?, title?}` | Queue a video, or a playlist / Mix as one block; entries download in queue order and show their progress in `/api/status` |
+| DELETE | `/api/queue/group/{block id}`   | Remove every upcoming entry of a block                         |
+| DELETE | `/api/youtube/jobs/{entry id}`  | Dismiss a failed download's notice                             |
 | GET    | `/api/tracks`                   | Audio + subtitle tracks of the playing file (501 without `vlc_http`) |
 | POST   | `/api/tracks` `{kind, id}`      | Select a track and remember it for the show; `kind` is `audio` or `subtitle`, `-1` disables |
 | DELETE | `/api/tracks/pref`              | Forget the remembered tracks for the playing show              |
-| POST   | `/api/queue/reorder` `{ids}`    | New order for the upcoming items (409 if the queue changed)    |
-| DELETE | `/api/queue/{id}`               | Remove an item from VLC's playlist                             |
+| POST   | `/api/queue/reorder` `{ids}`    | New order for the upcoming entries (entry ids); blocks stay together, unknown ids are ignored |
+| DELETE | `/api/queue/{id}`               | Remove an entry; removing the playing one is a skip            |
 | GET    | `/api/status`                   | Now playing (with title + poster), position, and the queue     |
 | POST   | `/api/control` `{action}`       | `pause` `play` `stop` `next` `previous` `fullscreen`           |
 
