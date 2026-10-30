@@ -691,11 +691,14 @@ def image_trim_cache() -> None:
                 pass
 
 
+def _ffprobe() -> str:
+    return shutil.which("ffprobe") or (str(Path(youtube.FFMPEG).with_name("ffprobe.exe")) if youtube.FFMPEG else "ffprobe")
+
+
 def _ffprobe_gif(path: Path) -> tuple[float, int]:
     """(duration seconds, frame count) of a GIF, or (0, 1) if ffprobe can't tell."""
     try:
-        ffprobe = shutil.which("ffprobe") or (str(Path(youtube.FFMPEG).with_name("ffprobe.exe")) if youtube.FFMPEG else "ffprobe")
-        r = subprocess.run([ffprobe, "-v", "error",
+        r = subprocess.run([_ffprobe(), "-v", "error",
                             "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames:format=duration",
                             "-of", "default=noprint_wrappers=1", str(path)], capture_output=True, text=True, timeout=60, check=False)
         kv = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
@@ -704,6 +707,47 @@ def _ffprobe_gif(path: Path) -> tuple[float, int]:
         return duration, frames
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return 0.0, 1
+
+
+# Library file lengths for the queue's time-left total. They used to come from VLC's playlist,
+# which now holds only two items, so each file is probed once when it's first queued.
+DURATIONS_FILE = BASE_DIR / "cache" / "durations.json"
+durations: dict[str, int] = _load_json(DURATIONS_FILE)  # path key -> seconds
+durations_lock = threading.Lock()
+
+
+def probe_duration(path: Path) -> float:
+    """Length of a video file in seconds from its container header, or 0 if ffprobe can't tell."""
+    try:
+        r = subprocess.run([_ffprobe(), "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                           capture_output=True, text=True, timeout=30, check=False)
+        return float(r.stdout.strip() or 0)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
+def file_duration(path: str) -> int | None:
+    with durations_lock:
+        return durations.get(_path_key(path))
+
+
+def learn_durations(paths: list[str]) -> None:
+    """Probe the files with no known length yet. Blocks: a NAS read per file, so run it off-thread."""
+    with durations_lock:
+        todo = [p for p in dict.fromkeys(paths) if _path_key(p) not in durations]
+    found = {}
+    for p in todo:
+        if (seconds := probe_duration(Path(p))) > 0:
+            found[_path_key(p)] = round(seconds)
+    if found:
+        with durations_lock:
+            durations.update(found)
+            _save_json(DURATIONS_FILE, durations)
+
+
+def learn_durations_in_background(paths: list[str]) -> None:
+    threading.Thread(target=learn_durations, args=(paths,), name="duration-probe", daemon=True).start()
 
 
 def normalize_image(src: Path, dest: Path) -> None:
@@ -809,7 +853,7 @@ def entry_row(e: Entry, current: bool, progress: dict, blocks: dict) -> dict:
     if e.kind == "file" and row["uri"]:
         info = library.describe(row["uri"])
         row.update(title=info["title"] or e.title, poster=info["poster"], episode=info["episode"],
-                   name=Path(e.path).name)
+                   name=Path(e.path).name, duration=row["duration"] if row["duration"] > 0 else file_duration(e.path) or -1)
     elif e.kind == "youtube":
         row["name"] = e.meta.get("uploader") or "YouTube"
     elif e.kind == "image":
@@ -1021,6 +1065,8 @@ async def lifespan(_: FastAPI):
     yt_trim_cache()
     image_trim_cache()
     library.scan_in_background()
+    current, upcoming, _ = play_queue.view()  # a queue saved before durations were probed
+    learn_durations_in_background([e.path for e in [current, *upcoming] if e and e.kind == "file" and e.path])
     threading.Thread(target=start_playback, name="queue-start", daemon=True).start()
     threading.Thread(target=track_watcher, name="track-watcher", daemon=True).start()
     yield
@@ -1241,6 +1287,7 @@ def enqueue(ids: list[str], user: str, *, ip: str | None = None, label: str = ""
         block, entries = play_queue.add_block(label.strip()[:120], "season", items, queued_by=shown_by)
     else:
         entries = [play_queue.add(**it) for it in items]
+    learn_durations_in_background([str(p) for p in paths])
     queue_changed()
     started = playing_now(entries[0])
     for n, (item_id, path) in enumerate(zip(ids, paths)):

@@ -49,6 +49,8 @@ def env(tmp_path, monkeypatch):
         "QUEUE_FILE": tmp_path / "queue.json", "EVENT_LOG": tmp_path / "events.jsonl",
         "REQUESTERS_FILE": tmp_path / "requesters.json", "EXTRA_ITEMS_FILE": tmp_path / "extra.json",
         "requesters": {}, "extra_items": {}, "recent_failures": {}, "first_roll": {"pending": False},
+        "DURATIONS_FILE": tmp_path / "durations.json", "durations": {},
+        "probe_duration": lambda path: 0.0, "learn_durations_in_background": app.learn_durations,
     }.items():
         monkeypatch.setattr(app, name, value)
     monkeypatch.setattr(app.youtube, "available", lambda: True)
@@ -164,6 +166,21 @@ def test_a_season_is_one_block_and_starts_an_idle_vlc(env):
     assert queue[0]["current"] and queue[1]["group_label"] == "Show · Season 1"
     assert queue[1]["block_kind"] == "season" and queue[1]["queued_by"] == "Jo"
     assert {e["block_id"] for e in events(env, "library")} == {queue[0]["group"]}
+
+
+def test_library_files_get_their_length_probed_once(env, monkeypatch):
+    probed = []
+    monkeypatch.setattr(app, "probe_duration", lambda path: probed.append(path.name) or 1440.4)
+    env.client.post("/api/queue/batch", json={"ids": ["TV/s1e1.mkv", "TV/s1e2.mkv"], "label": "Show · Season 1"})
+    assert [r["duration"] for r in rows(env)] == [1440, 1440]
+    env.client.post("/api/queue", json={"id": "TV/s1e1.mkv"})  # the same file again: no second probe
+    assert probed == ["s1e1.mkv", "s1e2.mkv"] and rows(env)[-1]["duration"] == 1440
+    assert json.loads((env.tmp / "durations.json").read_text("utf-8"))  # kept for the next start
+
+
+def test_an_unprobeable_file_has_no_length(env):
+    env.client.post("/api/queue", json={"id": "Movies/odd.mkv"})
+    assert rows(env)[0]["duration"] == -1 and app.durations == {}
 
 
 def test_a_youtube_roll_is_solo_and_credited_to_claude(env):
