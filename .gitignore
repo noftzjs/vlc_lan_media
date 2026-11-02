@@ -6,3 +6,4 @@ cache/
 tools/*
 !tools/queue_report.py
 .pytest_cache/
+.claude/settings.local.json

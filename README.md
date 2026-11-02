@@ -28,8 +28,16 @@ New-NetFirewallRule -DisplayName "LAN Projector Queue" -Direction Inbound -Proto
 That launches VLC with its web interface (password `Password123`, bound to localhost only)
 and starts the FastAPI server on port 8000. Guests open `http://<this PC's IP>:8000`.
 
-If VLC is already open, `start.ps1` leaves it alone; in that case VLC needs
-*Preferences > Interface > Main interfaces > Web* ticked and the Lua HTTP password set.
+If VLC is already open with the script's flags, `start.ps1` leaves it alone; a VLC opened by
+hand is restarted with them. While the server runs, the script also watches VLC: if it dies
+(a crash, or closed at the projector) it is started again within a few seconds, so stop
+everything with Ctrl+C in the script's window rather than by closing VLC. A page that finds
+VLC running without the custom HTTP folder shows a one-time warning.
+
+**After a VLC crash:** VLC logs to `cache/vlc.log` (appended across restarts), and the crash
+dump from `%APPDATA%\vlc\crashdump` is copied to `cache/vlc_crashdumps/` before VLC is
+relaunched. The relaunched VLC asks whether to send a bug report before it starts; answer it
+at the projector (that clears VLC's own copy of the dump, which is fine once it is copied).
 
 ## Sharing with guests
 
@@ -192,9 +200,18 @@ console, and appended to `cache/queue.log` (timestamp, name, file).
 
 ## Reordering the queue
 
-Drag the ⠿ handle in "Up next" (works on touch). VLC's HTTP API has no "move" command, so
-the server removes the upcoming items and re-adds them in the new order; the playing item is
-never touched. Already-played items stay in VLC's playlist but are hidden from the page.
+Drag the ⠿ handle in "Up next" (works on touch). The app owns the queue, so a drag only
+reorders the app's list (`cache/queue.json`, saved after every change); VLC is never asked to
+move anything, because it only ever holds the item playing and the next one, and the feeder
+hands it the new next item when the current one ends. The playing item is never touched.
+
+- A block (a season, playlist or Mix) moves as one by its header, and its items can be
+  reordered only inside it. A drag that would put something between a block's items is undone
+  so the block stays together.
+- Moving an entry up also moves its YouTube download up, since downloads run in queue order.
+- Played entries leave the queue; the last 20 are kept, and ⏮ puts the most recent back at the
+  front.
+- Anyone can reorder or remove anything; each change is logged with who made it.
 
 ## Known quirks
 

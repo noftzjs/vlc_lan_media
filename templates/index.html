@@ -232,7 +232,7 @@
             if (typeof options.body === 'string' && !options.headers) options.headers = {'Content-Type': 'application/json'};
             const res = await fetch(path, options);
             const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+            if (!res.ok) throw Object.assign(new Error(data.detail || `HTTP ${res.status}`), {status: res.status});
             return data;
         }
 
@@ -676,7 +676,7 @@
         }
 
         // --- Audio / subtitle tracks ---
-        let tracksRetry = 0;
+        let tracksRetry = 0, warnedNoVlcHttp = false;
         async function loadTracks(retry = 0) {
             const row = document.getElementById('tracks');
             if (lastCurrentId === null) { row.hidden = true; return; }
@@ -688,6 +688,8 @@
                 fillTracks(t);
             } catch (e) {
                 row.hidden = true;  // VLC not launched with the custom HTTP folder, or nothing playing
+                // 501: VLC was opened by hand, without vlc_http. Say so once per page load, not every poll.
+                if (e.status === 501 && !warnedNoVlcHttp) { warnedNoVlcHttp = true; toast(e.message, true); }
             }
         }
 

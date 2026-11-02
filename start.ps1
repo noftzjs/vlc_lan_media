@@ -41,7 +41,28 @@ if ($running -and -not ($running.CommandLine -join ' ').Contains('--lua-config')
     Start-Sleep -Seconds 2
 }
 
-if (-not (Get-Process vlc -ErrorAction SilentlyContinue)) {
+# Crash evidence: VLC appends a log to cache\vlc.log (warnings and errors; --log-verbose=3 adds
+# debug). A crash leaves a dump in %APPDATA%\vlc\crashdump, and answering VLC's "send a bug report?"
+# prompt on the next start deletes it, so it is copied to cache\vlc_crashdumps first.
+$VlcLog    = Join-Path $PSScriptRoot "cache\vlc.log"
+$CrashDir  = Join-Path $env:APPDATA "vlc\crashdump"
+$CrashKeep = Join-Path $PSScriptRoot "cache\vlc_crashdumps"
+New-Item -ItemType Directory -Force (Split-Path $VlcLog) | Out-Null
+
+function Save-VlcCrashDumps {
+    $dumps = Get-ChildItem $CrashDir -File -ErrorAction SilentlyContinue
+    if (-not $dumps) { return }
+    New-Item -ItemType Directory -Force $CrashKeep | Out-Null
+    foreach ($d in $dumps) {  # named by the dump's own time, so a dump still waiting on the prompt is kept once
+        $keep = Join-Path $CrashKeep ("{0:yyyyMMdd-HHmmss}-{1}" -f $d.LastWriteTime, $d.Name)
+        if (Test-Path $keep) { continue }
+        Copy-Item $d.FullName $keep
+        Write-Warning "VLC left a crash dump; copied to $keep (log: $VlcLog)"
+    }
+}
+
+function Start-Vlc {
+    Save-VlcCrashDumps
     Write-Host "Starting VLC with web interface on port $VlcPort..."
     # --http-host 127.0.0.1 keeps VLC's own web UI off the LAN; only this app talks to it.
     Start-Process $VlcExe -ArgumentList @(
@@ -56,6 +77,7 @@ if (-not (Get-Process vlc -ErrorAction SilentlyContinue)) {
         "--no-video-title-show",
         "--no-interact",                  # no modal error dialogs: an unplayable item is skipped, not a frozen player
         "--no-random", "--no-loop", "--no-repeat",  # the app's feeder needs VLC to play its list in order
+        "--file-logging", "--logfile=`"$VlcLog`"", "--log-verbose=2",  # appends, so a relaunch keeps the crash's lines
         "--qt-minimal-view"
     )
     # Wait until VLC's web interface answers (up to ~15s) so the app doesn't start against nothing.
@@ -65,6 +87,10 @@ if (-not (Get-Process vlc -ErrorAction SilentlyContinue)) {
         $ready = $null -ne (Get-NetTCPConnection -LocalPort $VlcPort -State Listen -ErrorAction SilentlyContinue)
     }
     if ($ready) { Write-Host "VLC web interface is up." } else { Write-Warning "VLC did not open port $VlcPort." }
+}
+
+if (-not (Get-Process vlc -ErrorAction SilentlyContinue)) {
+    Start-Vlc
 } else {
     Write-Host "VLC is already running with this script's settings."
 }
@@ -73,6 +99,22 @@ $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet","Wi-Fi" -
 Write-Host ""
 Write-Host "LAN Projector Queue is at:  http://${ip}:$WebPort" -ForegroundColor Green
 Write-Host "(If other machines can't reach it, allow TCP $WebPort through Windows Firewall; see README.md)"
+Write-Host "Stop with Ctrl+C here. Closing VLC on its own just gets it relaunched."
 Write-Host ""
 
-& "$PSScriptRoot\.venv\Scripts\uvicorn.exe" app:app --host 0.0.0.0 --port $WebPort
+# The server runs alongside a watchdog: if VLC dies (a crash, or closed at the projector) it is
+# started again with the flags above and the app's feeder carries on (an item cut off part-way
+# is held until Play is pressed on the page, like a stop at the projector).
+$web = Start-Process "$PSScriptRoot\.venv\Scripts\uvicorn.exe" -ArgumentList "app:app", "--host", "0.0.0.0", "--port", "$WebPort" -NoNewWindow -PassThru
+try {
+    while (-not $web.HasExited) {
+        Start-Sleep -Seconds 5
+        if (-not $web.HasExited -and -not (Get-Process vlc -ErrorAction SilentlyContinue)) {
+            Write-Warning "VLC is gone; relaunching it ($(Get-Date -Format 'HH:mm:ss'))"
+            Start-Vlc
+        }
+    }
+} finally {
+    # Ctrl+C reaches uvicorn too; give it time to shut down cleanly, then end it and its python child.
+    if (-not $web.WaitForExit(10000)) { taskkill /T /F /PID $web.Id 2>$null | Out-Null }
+}
