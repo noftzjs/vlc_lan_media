@@ -6,6 +6,7 @@ to the projector) through VLC's built-in HTTP interface.
 """
 
 import hashlib
+import html
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -22,9 +24,10 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 import requests
+import segno
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -1106,6 +1109,50 @@ class ReorderRequest(BaseModel):
 @app.get("/")
 def home():
     return FileResponse(BASE_DIR / "templates" / "index.html")
+
+
+# The address guests type: a local DNS record at the router points queue.lan at the laptop.
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://queue.lan").rstrip("/")
+WEB_PORT = int(os.environ.get("WEB_PORT", "8000"))  # start.ps1 sets it to the port uvicorn was given
+
+
+def lan_ip() -> str:
+    """This PC's address on the LAN. Connecting a UDP socket sends nothing; it only picks the
+    interface the default route would use."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("10.255.255.255", 1))
+            return s.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+
+
+@app.get("/qr", response_class=HTMLResponse)
+def qr_page():
+    """QR codes for the projector or a printed sign. The IP one is for phones that skip the
+    router's DNS (Android with Private DNS on), which can't resolve queue.lan."""
+    ip_url = f"http://{lan_ip()}" + ("" if WEB_PORT == 80 else f":{WEB_PORT}")
+
+    def code(url: str, scale: int) -> str:
+        return segno.make(url, error="m").svg_inline(scale=scale, border=2, dark="#000", light="#fff")
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Join the queue</title><link rel="icon" href="/static/vlc16x16.png">
+<style>
+  body {{ font-family: system-ui, sans-serif; background: #121212; color: #e0e0e0; margin: 0; min-height: 100vh;
+         display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; padding: 16px; text-align: center; }}
+  h1 {{ margin: 0; font-size: clamp(1.6rem, 5vw, 3rem); }}
+  .url {{ font-size: clamp(1.3rem, 4vw, 2.4rem); color: #ff5722; font-weight: 600; }}
+  svg {{ display: block; max-width: 90vw; height: auto; border-radius: 8px; }}
+  .fallback {{ display: flex; align-items: center; gap: 14px; color: #999; text-align: left; }}
+  .fallback b {{ color: #e0e0e0; }}
+</style></head><body>
+  <h1>Pick what plays next</h1>
+  {code(PUBLIC_URL, 14)}
+  <div class="url">{html.escape(PUBLIC_URL)}</div>
+  <div class="fallback">{code(ip_url, 4)}<div>Doesn't open?<br>Use <b>{html.escape(ip_url)}</b></div></div>
+</body></html>"""
 
 
 @app.get("/api/media")

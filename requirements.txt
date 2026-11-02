@@ -3,3 +3,4 @@ uvicorn[standard]
 requests
 yt-dlp[default]
 python-multipart
+segno  # QR codes for /qr

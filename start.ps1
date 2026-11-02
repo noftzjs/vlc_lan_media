@@ -1,16 +1,26 @@
 # Launches VLC (with its web interface enabled) and the FastAPI server.
 # Run from PowerShell:  .\start.ps1
-# Then open http://<this-pc's-LAN-IP>:8000 from any device on the LAN.
+# Then open http://queue.lan from any device on the LAN (the router's DNS record points it at
+# this PC), or http://<this-pc's-LAN-IP>. /qr shows both as QR codes for the projector.
 
 $ErrorActionPreference = "Stop"
 $VlcExe      = "C:\Program Files\VideoLAN\VLC\vlc.exe"
 $VlcPassword = "Password123"
 $VlcPort     = 8080
-$WebPort     = 8000
+$WebPort     = 80          # so the address needs no :port; falls back to 8000 if 80 is taken
+$PublicUrl   = "http://queue.lan"
+
+if (Get-NetTCPConnection -LocalPort $WebPort -State Listen -ErrorAction SilentlyContinue) {
+    Write-Warning "Port $WebPort is already in use (IIS, Skype or another web server?); using 8000 instead."
+    $WebPort   = 8000
+    $PublicUrl = "${PublicUrl}:8000"
+}
 
 # Pass the settings to app.py (it also has these as defaults).
 $env:VLC_PASSWORD = $VlcPassword
 $env:VLC_PORT     = "$VlcPort"
+$env:WEB_PORT     = "$WebPort"
+$env:PUBLIC_URL   = $PublicUrl
 # $env:MEDIA_DIRS = "N:\TV Shows;N:\Movies;N:\Anime"   # uncomment to change which folders are shared
 
 # YouTube support: yt-dlp needs a JavaScript runtime. Fetch a portable Deno once into tools\deno,
@@ -96,9 +106,14 @@ if (-not (Get-Process vlc -ErrorAction SilentlyContinue)) {
 }
 
 $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet","Wi-Fi" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty IPAddress)
+$portSuffix = if ($WebPort -eq 80) { "" } else { ":$WebPort" }
 Write-Host ""
-Write-Host "LAN Projector Queue is at:  http://${ip}:$WebPort" -ForegroundColor Green
-Write-Host "(If other machines can't reach it, allow TCP $WebPort through Windows Firewall; see README.md)"
+Write-Host "LAN Projector Queue is at:  $PublicUrl  (or http://${ip}$portSuffix)" -ForegroundColor Green
+Write-Host "QR codes for the projector: http://localhost$portSuffix/qr"
+$rule = Get-NetFirewallRule -DisplayName "LAN Projector Queue" -ErrorAction SilentlyContinue
+if (-not $rule -or "$WebPort" -notin @(($rule | Get-NetFirewallPortFilter).LocalPort)) {
+    Write-Warning "The 'LAN Projector Queue' firewall rule doesn't allow port $WebPort; phones may not reach the page. See README.md, 'One-time setup'."
+}
 Write-Host "Stop with Ctrl+C here. Closing VLC on its own just gets it relaunched."
 Write-Host ""
 

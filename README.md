@@ -13,8 +13,12 @@ python -m venv .venv
 Allow the web app through Windows Firewall (run once, from an **elevated** PowerShell):
 
 ```powershell
-New-NetFirewallRule -DisplayName "LAN Projector Queue" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow -Profile Any
+New-NetFirewallRule -DisplayName "LAN Projector Queue" -Direction Inbound -Protocol TCP -LocalPort 80,8000 -Action Allow -Profile Any
 ```
+
+If the rule already exists from before (port 8000 only), widen it instead:
+`Set-NetFirewallRule -DisplayName "LAN Projector Queue" -LocalPort 80,8000`. `start.ps1` warns
+when the rule is missing or doesn't cover the port it is using.
 
 (`-Profile Any` because this PC's network is currently classed as *Public*. Delete the rule after the party with
 `Remove-NetFirewallRule -DisplayName "LAN Projector Queue"`.)
@@ -26,7 +30,8 @@ New-NetFirewallRule -DisplayName "LAN Projector Queue" -Direction Inbound -Proto
 ```
 
 That launches VLC with its web interface (password `Password123`, bound to localhost only)
-and starts the FastAPI server on port 8000. Guests open `http://<this PC's IP>:8000`.
+and starts the FastAPI server on port 80 (8000 if something else already holds 80). Guests open
+`http://queue.lan`; `http://localhost/qr` shows QR codes for the projector.
 
 If VLC is already open with the script's flags, `start.ps1` leaves it alone; a VLC opened by
 hand is restarted with them. While the server runs, the script also watches VLC: if it dies
@@ -43,15 +48,18 @@ at the projector (that clears VLC's own copy of the dump, which is fine once it 
 
 Guests just open a URL on their phone. Make that URL easy and stable:
 
-- **Short address.** This PC's hostname is `Noftzjs`, so try `http://noftzjs:8000`
-  (Windows, Android) or `http://noftzjs.local:8000` (iPhone, Mac). Test both from a phone
-  before the party. Fall back to the IP (`http://192.168.2.84:8000`) if neither resolves.
-- **Pin the IP.** The Ethernet address is DHCP-assigned and can change after a reboot.
-  Reserve `192.168.2.84` for this PC's MAC address in the router's DHCP settings, or set a
-  static IP on the adapter.
-- **QR code on the projector.** Generate a QR code for the URL, show it on the projector
-  before the first video, and tape a printed copy somewhere visible. (A built-in `/qr` page
-  is on the ideas list below.)
+- **Which PC.** The **laptop** hosts the queue at the LAN; the desktop
+  (`DESKTOP-S7AQTVN`, `192.168.2.44`) runs the stream and is not the queue host. The
+  names and addresses below are the laptop's.
+- **Address: `http://queue.lan`.** The router (192.168.2.1) reserves `192.168.2.84` for the
+  laptop and has a local DNS record `queue.lan -> 192.168.2.84`. Type the `http://` the first
+  time, or the browser may treat `queue.lan` as a search. Fallbacks: `http://192.168.2.84`, or
+  the hostname `http://noftzjs` (Windows, Android) / `http://noftzjs.local` (iPhone, Mac).
+- **Private DNS phones.** Android with "Private DNS" on skips the router's DNS and can't
+  resolve `queue.lan`; those guests use the IP.
+- **QR codes: `/qr`.** A big code for `http://queue.lan` and a small one for the IP (for the
+  Private DNS phones). Show it on the projector before the first video and print a copy for
+  the wall. `PUBLIC_URL` in `start.ps1` changes the address it encodes.
 - **Same network.** Guests must be on the main Wi-Fi, not a guest network. Guest networks
   usually isolate clients from the LAN.
 - **Wired PC.** Keep the projector PC on Ethernet so playback from the NAS is smooth.

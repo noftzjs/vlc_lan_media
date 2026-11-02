@@ -43,8 +43,9 @@ Queue rebuild (spec: docs/queue_rebuild.md, branch jn/youtube-queue-rebuild; cut
 - [ ] Parked: offline fast path for a cached YouTube video (skip yt-dlp when the file and its remembered metadata exist) if the venue's internet is flaky
 - [ ] Undecided: desktop two-column layout above ~1400px (Now playing + Up next left, library right) so the queue stays in view while browsing
 - [x] Secret menu: `@claude` in the search box rolls a random movie / episode / anime / cached YouTube video (2026-10-23)
-- [ ] `/qr` page with a QR code for the LAN address *(2026-10-23: do after the `.lan` record is in place; then it encodes the readable address and gets printed for the wall, mainly for phones and Android with Private DNS)*
-- [ ] Readable address for the party: a local DNS record at the gateway router (e.g. `queue.lan` -> this PC's reserved IP), the same plan as 3D_flex docs/deployment.md §5; then the README's short-address section and the QR idea become one line
+- [x] `/qr` page with a QR code for the LAN address *(2026-11-02: big code for PUBLIC_URL (http://queue.lan), small one for the IP for Private DNS phones)*
+- [x] Readable address for the party: a local DNS record at the gateway router (e.g. `queue.lan` -> the **laptop's** reserved IP; the laptop hosts the queue at the LAN, not the streaming desktop; confirm its IP and MAC on the laptop, README says `192.168.2.84`) *(2026-11-02: router has the reservation and the record; start.ps1 serves on port 80 so the address needs no :port)*
+- [ ] On the laptop: pull, `pip install -r requirements.txt` (segno), widen the firewall rule to 80,8000, run start.ps1 and open http://queue.lan and /qr from a phone, the same plan as 3D_flex docs/deployment.md §5; then the README's short-address section and the QR idea become one line
 - [x] Show own filename for queue items (done server-side; verify after restart) *(2026-10-23: the file line was right; the title line now adds an episode marker, S02E05 / E02 / the file's own name for extras, so a queued season no longer reads as 24 rows of the show title. Now playing shows it too.)*
 
 ## YouTube

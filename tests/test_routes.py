@@ -274,3 +274,15 @@ def test_youtube_items_have_no_track_selector(env):
     assert env.client.get("/api/tracks").json()["audio"] == []
     r = env.client.post("/api/tracks", json={"kind": "audio", "id": -1})
     assert r.status_code == 409 and env.vlc.audio[env.vlc.current] == 1  # still on track 1
+
+
+def test_qr_page_encodes_the_readable_address_and_the_ip(monkeypatch):
+    """The big code is queue.lan; the small one is the IP, for phones that skip the router's DNS."""
+    monkeypatch.setattr(app, "PUBLIC_URL", "http://queue.lan")
+    monkeypatch.setattr(app, "WEB_PORT", 80)
+    monkeypatch.setattr(app, "lan_ip", lambda: "192.168.2.84")
+    page = TestClient(app.app).get("/qr")
+    assert page.status_code == 200
+    assert page.text.count("<svg") == 2
+    assert "http://queue.lan" in page.text
+    assert "http://192.168.2.84<" in page.text  # no :80 on the default port
