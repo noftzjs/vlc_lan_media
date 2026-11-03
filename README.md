@@ -57,6 +57,9 @@ Guests just open a URL on their phone. Make that URL easy and stable:
   the hostname `http://noftzjs` (Windows, Android) / `http://noftzjs.local` (iPhone, Mac).
 - **Private DNS phones.** Android with "Private DNS" on skips the router's DNS and can't
   resolve `queue.lan`; those guests use the IP.
+- **Chrome on Android won't open it** (even by IP, while other browsers do): use another
+  browser. Seen 2026-11-02 on a phone with Android Advanced Protection on; Chrome showed
+  no local-network setting to change, and Kiwi loaded the page fine.
 - **QR codes: `/qr`.** A big code for `http://queue.lan` and a small one for the IP (for the
   Private DNS phones). Show it on the projector before the first video and print a copy for
   the wall. `PUBLIC_URL` in `start.ps1` changes the address it encodes.
